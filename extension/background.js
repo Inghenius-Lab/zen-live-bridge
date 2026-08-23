@@ -38,7 +38,9 @@ function scheduleReconnect() {
 
 // MV3: el service worker no es persistente -> alarma de respaldo que
 // despierta el SW y reconecta si el WebSocket se cerro durante el sueno.
-browser.alarms.create("zen-live-keepalive", { periodInMinutes: 1 });
+browser.alarms.create("zen-live-keepalive", { periodInMinutes: 0.5 });
+browser.runtime.onStartup.addListener(() => connect());
+browser.runtime.onInstalled.addListener(() => connect());
 browser.alarms.onAlarm.addListener(() => {
   if (!ws || ws.readyState > WebSocket.OPEN) {
     clearTimeout(timer);

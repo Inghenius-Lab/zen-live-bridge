@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Zen Live Bridge",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Puente local (WebSocket 127.0.0.1:8788) para controlar Zen abierto desde agentes. Todo local, nada sale de la maquina.",
   "browser_specific_settings": {
     "gecko": {
@@ -9,10 +9,19 @@
     }
   },
   "background": {
-    "scripts": ["background.js"]
+    "scripts": [
+      "background.js"
+    ]
   },
-  "permissions": ["tabs", "cookies", "scripting", "alarms"],
-  "host_permissions": ["<all_urls>"],
+  "permissions": [
+    "tabs",
+    "cookies",
+    "scripting",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'; connect-src ws://127.0.0.1:8788"
   }
