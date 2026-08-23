@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""zen-live — CLI para controlar la instancia de Zen ABIERTA via WebExtension.
+
+Uso:
+  zen-live serve                      arranca el puente local (TCP 8787 + WS 8788)
+  zen-live status                     comprueba puente + extension
+  zen-live stop                       apaga el puente
+  zen-live tabs                       lista pestanyas del Zen abierto
+  zen-live goto URL [--new|--same]    abre pestanya (sin robar foco) o navega la activa
+  zen-live activate [TABID]           marca activa (y trae la ventana al frente si hace falta)
+  zen-live text [--limit N]           texto visible de la pestanya activa
+  zen-live snap                       texto + interactivos con selectores css
+  zen-live click --sel CSS | --text TEXTO [--wait MS]
+  zen-live fill --sel CSS --value V [--submit] [--wait MS]
+  zen-live js 'EXPRESION'             evalua JS en la pestanya activa
+  zen-live shot NOMBRE                captura PNG a /tmp/zen-shot/NOMBRE.png
+  zen-live cookies [URL]              cookies de un sitio (por defecto el activo)
+  zen-live close TABID                cierra una pestanya (las del agente, no las tuyas)
+
+Requiere: la extension "Zen Live Bridge" cargada en Zen (about:debugging o
+instalada). Sin extension, ping falla con mensaje claro.
+"""
+import base64, json, os, socket, subprocess, sys, time
+
+TCP_PORT = int(os.environ.get("ZEN_LIVE_TCP", "8787"))
+WS_PORT = int(os.environ.get("ZEN_LIVE_WS", "8788"))
+BRIDGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zen-live-bridge.py")
+
+
+def send(cmd, timeout=120):
+    try:
+        s = socket.create_connection(("127.0.0.1", TCP_PORT), timeout=5)
+    except OSError as e:
+        return {"ok": False, "error": f"puente caido: {e}. Arranca con 'zen-live serve'"}
+    try:
+        s.sendall((json.dumps(cmd) + "\n").encode())
+        s.settimeout(timeout + 10)
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    except Exception as e:
+        return {"ok": False, "error": f"tcp: {e}"}
+    finally:
+        s.close()
+    try:
+        return json.loads(buf.split(b"\n", 1)[0].decode())
+    except Exception:
+        return {"ok": False, "error": f"respuesta invalida: {buf[:200]!r}"}
+
+
+def ensure_server():
+    if server_up():
+        return True
+    log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "server.log")
+    log = os.path.abspath(log)
+    with open(log, "a") as f:
+        subprocess.Popen([sys.executable, BRIDGE], stdout=f, stderr=subprocess.STDOUT,
+                         start_new_session=True)
+    for _ in range(30):
+        if server_up():
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def server_up():
+    try:
+        s = socket.create_connection(("127.0.0.1", TCP_PORT), timeout=0.5)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def status():
+    up = server_up()
+    if not up:
+        print("puente:  DOWN  (arranca con 'zen-live serve')")
+        return
+    ping = send({"cmd": "ping"}, timeout=10)
+    if ping.get("pong"):
+        print(f"puente:  UP  (tcp 8787 / ws {WS_PORT})")
+        print(f"extension: OK  {ping.get('name')} v{ping.get('version')}")
+    else:
+        print("puente:  UP  (tcp 8787 / ws 8788)")
+        print(f"extension: DESCONECTADA — carga 'Zen Live Bridge' en about:debugging "
+              f"o instalala en about:addons ({ping.get('error','')})")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__)
+        return
+    cmd = args.pop(0)
+
+    if cmd == "serve":
+        if server_up():
+            print("puente ya activo"); return
+        log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "server.log")
+        with open(os.path.abspath(log), "a") as f:
+            subprocess.Popen([sys.executable, BRIDGE], stdout=f, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+        for _ in range(30):
+            if server_up():
+                print("puente activo (tcp 8787 / ws 8788). Extension lista? -> zen-live status")
+                return
+            time.sleep(0.2)
+        print("ERROR: el puente no arranco. Mira el log")
+        return
+
+    if cmd == "stop":
+        try:
+            send({"cmd": "shutdown"}, timeout=5)
+            print("puente apagado")
+        except Exception as e:
+            print(f"no se pudo apagar: {e}")
+        return
+
+    if cmd == "status":
+        status()
+        return
+
+    if not ensure_server():
+        print("ERROR: no hay puente. Arranca con 'zen-live serve'")
+        sys.exit(1)
+
+    if cmd == "tabs":
+        r = send({"cmd": "tabs"})
+        for t in r.get("tabs", []):
+            mark = "*" if t["active"] else " "
+            print(f"{mark} {t['id']:>4}  {t['title'][:50] or '(sin titulo)'}  {t['url'][:80]}")
+        return
+
+    if cmd == "goto":
+        url = args[0] if args else input("URL: ")
+        mode = "new" if "--new" in sys.argv or "-n" in sys.argv else ("same" if "--same" in sys.argv else "new")
+        wait = None
+        if "--wait" in sys.argv:
+            wait = int(sys.argv[sys.argv.index("--wait") + 1])
+        r = send({"cmd": "goto", "url": url, "new": mode == "new", "wait": wait})
+        print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "activate":
+        tab_id = args[0] if args else None
+        r = send({"cmd": "activate", "tabId": (int(tab_id) if tab_id else None)})
+        print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "text":
+        limit = 60000
+        if "--limit" in sys.argv:
+            limit = int(sys.argv[sys.argv.index("--limit") + 1])
+        r = send({"cmd": "text", "limit": limit})
+        if r.get("ok"):
+            print(r.get("text", ""))
+        else:
+            print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "snap":
+        r = send({"cmd": "snap"})
+        if not r.get("ok"):
+            print(json.dumps(r, ensure_ascii=False)); return
+        print(f"== {r.get('title','')} — {r.get('url','')}")
+        for e in r.get("els", []):
+            print(f"[{e['i']}] <{e['tag']}> {e['text'][:70] or '(sin texto)'}  css={e['css']}")
+        print("---- texto ----")
+        print(r.get("text", "")[:8000])
+        return
+
+    if cmd == "click":
+        sel = None; text = None; wait = None
+        if "--sel" in sys.argv: sel = sys.argv[sys.argv.index("--sel") + 1]
+        if "--text" in sys.argv: text = sys.argv[sys.argv.index("--text") + 1]
+        if "--wait" in sys.argv: wait = int(sys.argv[sys.argv.index("--wait") + 1])
+        if not sel and not text:
+            print("necesitas --sel CSS o --text TEXTO"); sys.exit(1)
+        r = send({"cmd": "click", "sel": sel, "text": text, "wait": wait})
+        print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "fill":
+        if "--sel" not in sys.argv:
+            print("necesitas --sel CSS y --value"); sys.exit(1)
+        sel = sys.argv[sys.argv.index("--sel") + 1]
+        value = sys.argv[sys.argv.index("--value") + 1] if "--value" in sys.argv else ""
+        submit = "--submit" in sys.argv
+        wait = int(sys.argv[sys.argv.index("--wait") + 1]) if "--wait" in sys.argv else None
+        r = send({"cmd": "fill", "sel": sel, "value": value, "submit": submit, "wait": wait})
+        print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "js":
+        expr = " ".join(a for a in args if not a.startswith("--"))
+        r = send({"cmd": "js", "expr": expr})
+        if r.get("ok"):
+            val = r.get("value")
+            print(val if isinstance(val, str) else json.dumps(val, ensure_ascii=False))
+        else:
+            print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "shot":
+        name = args[0] if args else "captura"
+        r = send({"cmd": "shot"})
+        if not r.get("ok"):
+            print(json.dumps(r, ensure_ascii=False)); return
+        out_dir = "/tmp/zen-shot"
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, name + ".png")
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(r["dataUrl"].split(",", 1)[-1]))
+        print(path)
+        return
+
+    if cmd == "cookies":
+        url = args[0] if args else None
+        r = send({"cmd": "cookies", "url": url})
+        for c in r.get("cookies", []):
+            print(f"{c['domain']:30} {c['name']:30} {c['value'][:40]}")
+        return
+
+    if cmd == "close":
+        if not args:
+            print("zen-live close TABID — usa 'zen-live tabs' para ver ids"); return
+        r = send({"cmd": "close", "tabId": int(args[0])})
+        print(json.dumps(r, ensure_ascii=False))
+        return
+
+    print(__doc__)
+
+
+if __name__ == "__main__":
+    main()
