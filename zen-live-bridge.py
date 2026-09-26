@@ -2,7 +2,7 @@
 """Zen Live Bridge server — puente entre agentes (TCP) y la extension Zen (WebSocket).
 
 Arquitectura:
-  agente/CLI  --TCP 127.0.0.1:8787 (JSON lines)-->  zen-live-bridge.py
+  agente/CLI  --TCP 127.0.0.1:8790 (JSON lines)-->  zen-live-bridge.py
   extension   --WS  127.0.0.1:8788 (JSON)----------> zen-live-bridge.py
 La extension (WebExtension MV2 en Zen) se conecta como cliente WS; el server
 reenvia comandos con id y devuelve las respuestas al agente que los pidio.
@@ -12,7 +12,7 @@ hasta 64-bit). Solo escucha en 127.0.0.1.
 """
 import base64, hashlib, json, os, socket, struct, sys, threading, time
 
-TCP_PORT = int(os.environ.get("ZEN_LIVE_TCP", "8787"))
+TCP_PORT = int(os.environ.get("ZEN_LIVE_TCP", "8790"))  # 8787 = stt-server (canonico ecosistema)
 WS_PORT = int(os.environ.get("ZEN_LIVE_WS", "8788"))
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 

@@ -2,7 +2,7 @@
 """zen-live — CLI para controlar la instancia de Zen ABIERTA via WebExtension.
 
 Uso:
-  zen-live serve                      arranca el puente local (TCP 8787 + WS 8788)
+  zen-live serve                      arranca el puente local (TCP 8790 + WS 8788)
   zen-live status                     comprueba puente + extension
   zen-live stop                       apaga el puente
   zen-live tabs                       lista pestanyas del Zen abierto
@@ -22,7 +22,7 @@ instalada). Sin extension, ping falla con mensaje claro.
 """
 import base64, json, os, socket, subprocess, sys, time
 
-TCP_PORT = int(os.environ.get("ZEN_LIVE_TCP", "8787"))
+TCP_PORT = int(os.environ.get("ZEN_LIVE_TCP", "8790"))  # 8787 = stt-server (canonico ecosistema)
 WS_PORT = int(os.environ.get("ZEN_LIVE_WS", "8788"))
 BRIDGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zen-live-bridge.py")
 
@@ -82,10 +82,10 @@ def status():
         return
     ping = send({"cmd": "ping"}, timeout=10)
     if ping.get("pong"):
-        print(f"puente:  UP  (tcp 8787 / ws {WS_PORT})")
+        print(f"puente:  UP  (tcp {TCP_PORT} / ws {WS_PORT})")
         print(f"extension: OK  {ping.get('name')} v{ping.get('version')}")
     else:
-        print("puente:  UP  (tcp 8787 / ws 8788)")
+        print(f"puente:  UP  (tcp {TCP_PORT} / ws {WS_PORT})")
         print(f"extension: DESCONECTADA — carga 'Zen Live Bridge' en about:debugging "
               f"o instalala en about:addons ({ping.get('error','')})")
 
@@ -106,7 +106,7 @@ def main():
                              start_new_session=True)
         for _ in range(30):
             if server_up():
-                print("puente activo (tcp 8787 / ws 8788). Extension lista? -> zen-live status")
+                print(f"puente activo (tcp {TCP_PORT} / ws {WS_PORT}). Extension lista? -> zen-live status")
                 return
             time.sleep(0.2)
         print("ERROR: el puente no arranco. Mira el log")
@@ -141,7 +141,12 @@ def main():
         wait = None
         if "--wait" in sys.argv:
             wait = int(sys.argv[sys.argv.index("--wait") + 1])
-        r = send({"cmd": "goto", "url": url, "new": mode == "new", "wait": wait})
+        payload = {"cmd": "goto", "url": url, "new": mode == "new", "wait": wait}
+        if "--container" in sys.argv:
+            payload["container"] = sys.argv[sys.argv.index("--container") + 1]
+        if "--cookie-store" in sys.argv:
+            payload["cookieStoreId"] = sys.argv[sys.argv.index("--cookie-store") + 1]
+        r = send(payload)
         print(json.dumps(r, ensure_ascii=False))
         return
 
@@ -168,7 +173,7 @@ def main():
             print(json.dumps(r, ensure_ascii=False)); return
         print(f"== {r.get('title','')} — {r.get('url','')}")
         for e in r.get("els", []):
-            print(f"[{e['i']}] <{e['tag']}> {e['text'][:70] or '(sin texto)'}  css={e['css']}")
+            print(f"[{e.get('i','?')}] <{e.get('tag','?')}> {e.get('text','')[:70] or '(sin texto)'}  css={e.get('css','(n/a)')}")
         print("---- texto ----")
         print(r.get("text", "")[:8000])
         return
@@ -191,16 +196,106 @@ def main():
         value = sys.argv[sys.argv.index("--value") + 1] if "--value" in sys.argv else ""
         submit = "--submit" in sys.argv
         wait = int(sys.argv[sys.argv.index("--wait") + 1]) if "--wait" in sys.argv else None
-        r = send({"cmd": "fill", "sel": sel, "value": value, "submit": submit, "wait": wait})
+        nth = int(sys.argv[sys.argv.index("--nth") + 1]) if "--nth" in sys.argv else None
+        r = send({"cmd": "fill", "sel": sel, "value": value, "submit": submit, "wait": wait, "nth": nth})
+        print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "shadowfill":
+        if "--sel" not in sys.argv:
+            print("necesitas --sel 'host>>>nivel>>>campo' y --value"); sys.exit(1)
+        sel = sys.argv[sys.argv.index("--sel") + 1]
+        value = sys.argv[sys.argv.index("--value") + 1] if "--value" in sys.argv else ""
+        submit = "--submit" in sys.argv
+        wait = int(sys.argv[sys.argv.index("--wait") + 1]) if "--wait" in sys.argv else None
+        r = send({"cmd": "shadowfill", "sel": sel, "value": value, "submit": submit, "wait": wait})
         print(json.dumps(r, ensure_ascii=False))
         return
 
     if cmd == "js":
         expr = " ".join(a for a in args if not a.startswith("--"))
-        r = send({"cmd": "js", "expr": expr})
+        payload = {"cmd": "js", "expr": expr}
+        if "--allow-eval" in sys.argv:
+            payload["allowEval"] = True
+        r = send(payload)
         if r.get("ok"):
             val = r.get("value")
             print(val if isinstance(val, str) else json.dumps(val, ensure_ascii=False))
+        else:
+            print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "list-containers":
+        r = send({"cmd": "listContainers"})
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return
+
+    if cmd == "cookies-for":
+        url = args[0] if args else input("URL: ")
+        payload = {"cmd": "cookiesFor", "url": url}
+        if "--cookie-store" in sys.argv:
+            payload["cookieStoreId"] = sys.argv[sys.argv.index("--cookie-store") + 1]
+        r = send(payload)
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return
+
+    if cmd == "focus":
+        tab_id = args[0] if args else None
+        r = send({"cmd": "focus", "tabId": (int(tab_id) if tab_id else None)})
+        print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "reload-ext":
+        r = send({"cmd": "reloadExt"})
+        print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "snap-refs":
+        r = send({"cmd": "snapRefs"})
+        if r.get("ok") and "els" in r:
+            limit = 90
+            if "--limit" in sys.argv:
+                limit = int(sys.argv[sys.argv.index("--limit") + 1])
+            only_viewport = "--all" not in sys.argv
+            els = r["els"]
+            if only_viewport:
+                els = [e for e in els if e.get("inViewport")]
+            print(f"# {r.get('title')} — {r.get('url')}")
+            for e in els[:limit]:
+                line = f"  [{e['ref']}] {e.get('role') or e['tag']}"
+                if e.get('name'): line += f" \"{e['name'][:80]}\""
+                if e.get('type'): line += f" (type={e['type']})"
+                print(line)
+            if len(els) > limit:
+                print(f"  ... ({len(els)-limit} más, sube --limit o quita --all)")
+        else:
+            print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "click-ref":
+        ref = args[0] if args else input("ref (ej: e3): ")
+        r = send({"cmd": "clickRef", "ref": ref})
+        print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "fill-ref":
+        if not args:
+            print("uso: zen-live fill-ref <ref> <valor> [--submit]"); sys.exit(1)
+        ref = args[0]
+        value = " ".join(a for a in args[1:] if not a.startswith("--"))
+        submit = "--submit" in sys.argv
+        r = send({"cmd": "fillRef", "ref": ref, "value": value, "submit": submit})
+        print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "doctor":
+        r = send({"cmd": "doctor"})
+        if r.get("ok") and "checks" in r:
+            c = r["checks"]
+            print(f"version={c.get('version')} manifest={c.get('manifest')} ws={c.get('ws')}")
+            perms = c.get("perms", {})
+            for k, v in perms.items():
+                print(f"  {k}: {'✓' if v else '✗'}")
         else:
             print(json.dumps(r, ensure_ascii=False))
         return
