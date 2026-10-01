@@ -21,6 +21,12 @@ Uso:
 
 Requiere: la extension "Zen Live Bridge" cargada en Zen (about:debugging o
 instalada). Sin extension, ping falla con mensaje claro.
+  localstorage <list|get|set|delete|clear> [clave] [valor]
+  sessionstorage <list|get|set|delete|clear> [clave] [valor]
+  storage-clear                        limpia localStorage y sessionStorage
+  network [filtro] [--limit N]         peticiones de red de la pagina
+  css <selector>                       estilos computados de un elemento
+  resize --width N --height N          redimensiona la ventana
 """
 import base64, json, os, socket, subprocess, sys, time
 from sys import argv
@@ -382,6 +388,69 @@ def main():
                 print("  [%-5s] %s" % (e.get("type"), e.get("text", "")[:110]))
         else:
             print(json.dumps(r, ensure_ascii=False))
+        return
+
+    # --- v0.10: almacenamiento, red, css, ventana ---
+    if cmd in ("localstorage", "sessionstorage"):
+        action = args[0] if args else "list"
+        r = send({"cmd": cmd, "action": action,
+                  "key": args[1] if len(args) > 1 else "",
+                  "value": args[2] if len(args) > 2 else "",
+                  "tabId": int(opt("--tab", "0")) or None})
+        if not r.get("ok"):
+            print(json.dumps(r, ensure_ascii=False)); return
+        if action == "list":
+            keys = r.get("keys", [])
+            print("%d claves en %s" % (len(keys), cmd))
+            for k in keys[:40]:
+                print("  %s" % k)
+            if len(keys) > 40:
+                print("  ... %d mas" % (len(keys) - 40))
+            print("  (solo claves; los valores se leen de uno en uno: '%s get <clave>')" % cmd)
+        elif action in ("get", "set", "delete", "clear"):
+            print("%s %s ok" % (cmd, action))
+        else:
+            print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "storage-clear":
+        r = send({"cmd": "storage-clear", "tabId": int(opt("--tab", "0")) or None})
+        print(json.dumps(r, ensure_ascii=False) if not r.get("ok")
+              else "localStorage y sessionStorage limpiados")
+        return
+
+    if cmd == "network":
+        r = send({"cmd": "network", "filter": args[0] if args else "",
+                  "limit": int(opt("--limit", "50")),
+                  "tabId": int(opt("--tab", "0")) or None})
+        if not r.get("ok"):
+            print(json.dumps(r, ensure_ascii=False)); return
+        items = r.get("items", [])
+        print("%d peticiones%s" % (len(items), (" de " + r["filter"]) if r.get("filter") else ""))
+        for it in items[:60]:
+            print("  %-6s %-9s %8s  %s" % (it.get("status", "-"), it.get("kind", "?"),
+                                            it.get("size", "-"), (it.get("url") or "")[:94]))
+        if r.get("redacted"):
+            print("  (%d query strings con tokens ocultos)" % r["redacted"])
+        return
+
+    if cmd == "css":
+        r = send({"cmd": "css", "sel": opt("--sel", "") or (args[0] if args else ""),
+                  "text": opt("--text", ""),
+                  "tabId": int(opt("--tab", "0")) or None})
+        if not r.get("ok"):
+            print(json.dumps(r, ensure_ascii=False)); return
+        print("estilos de %s" % (r.get("selector") or "?"))
+        for k, v in (r.get("styles") or {}).items():
+            print("  %-14s %s" % (k, v))
+        return
+
+    if cmd == "resize":
+        w, h = opt("--width", "0"), opt("--height", "0")
+        r = send({"cmd": "resize", "width": int(w) if w else None, "height": int(h) if h else None,
+                  "tabId": int(opt("--tab", "0")) or None})
+        print(json.dumps(r, ensure_ascii=False, indent=2) if not r.get("ok")
+              else "ventana ahora %sx%s" % (r.get("width"), r.get("height")))
         return
 
     if cmd == "set-range":

@@ -188,3 +188,33 @@ curl -X POST -H "X-Zen-Live-Token: $(cat ~/.local/state/zen-live-bridge/token)" 
 El historial vive **en memoria del proceso**: al reiniciar el puente se
 pierde. Es deliberado, no se escribe nada a disco.
 
+## Almacenamiento, red y estilos (v0.10)
+
+```bash
+zen-live localstorage list --tab N              # solo claves
+zen-live localstorage get CLAVE --tab N
+zen-live localstorage set CLAVE VALOR --tab N
+zen-live sessionstorage clear --tab N
+zen-live storage-clear --tab N                  # ambos de golpe
+
+zen-live network --limit 40 --tab N             # peticiones de la pagina
+zen-live network api.github.com --tab N         # filtrar por subcadena
+zen-live css h1 --tab N                         # estilos computados
+zen-live resize --width 1400 --height 900       # redimensiona la ventana
+```
+
+**`list` devuelve solo claves, nunca valores.** Un volcado de localStorage suele
+traer tokens de sesion y JWT; leerlos tiene que ser una accion deliberada
+(`get CLAVE`), no el efecto secundario de listar.
+
+**`network` oculta los tokens del query string** antes de devolver nada
+(`access_token`, `sig`, `api_key`, `password`, `jwt`, ...). Un log de red es
+justo el sitio donde un token se cuela en un archivo y se comparte sin querer.
+Los parametros normales (`page`, `sort`, `user`) se conservan: oculta lo
+sensible sin volver la salida inusable. Devuelve el contador `redacted` para
+saber si limpio algo.
+
+`css` y `resize` van por APIs de extension (`getComputedStyle`,
+`browser.windows`), no por inyeccion: uno lee estilos calculados y el otro
+cambia el estado de la ventana.
+

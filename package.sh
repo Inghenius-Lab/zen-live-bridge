@@ -68,13 +68,31 @@ fi
 
 if [[ "${1:-}" == "--restart-zen" ]]; then
   echo "reiniciando Zen..."
+  # El entorno hay que heredarlo del proceso Zen que ya corre: sin
+  # WAYLAND_DISPLAY / XDG_RUNTIME_DIR, zen-bin arranca y muere al instante.
+  # Si no hay ninguno corriendo (se murio antes, o es el primer arranque), se
+  # reconstruye desde la sesion actual, que en un server systemd de usuario si
+  # los tiene. Sin esto, un --restart-zen sin Zen previo dejaba el escritorio
+  # sin navegador y sin avisar.
   RUN=$(pgrep -x zen-bin | head -1)
   if [[ -n "$RUN" ]]; then
     eval "$(tr '\0' '\n' < "/proc/$RUN/environ" \
       | grep -E '^(WAYLAND_DISPLAY|DISPLAY|XDG_RUNTIME_DIR|XDG_CURRENT_DESKTOP|DBUS_SESSION_BUS_ADDRESS)=' \
       | sed 's/^\([A-Z_]*\)=\(.*\)$/export \1="\2"/')"
-    export XDG_SESSION_TYPE=wayland
     kill "$RUN"; sleep 7
+  fi
+  export XDG_SESSION_TYPE=wayland
+  # Si no vino de un proceso vivo, deducirlo de las sesiones de Wayland activas.
+  if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+    for d in /run/user/$(id -u)/wayland-*; do
+      [[ -S "$d" ]] && { WAYLAND_DISPLAY=$(basename "$d"); export WAYLAND_DISPLAY; break; }
+    done
+  fi
+  : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR
+  : "${DBUS_SESSION_BUS_ADDRESS:=unix:path=$XDG_RUNTIME_DIR/bus}"; export DBUS_SESSION_BUS_ADDRESS
+
+  if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+    echo "AVISO: no hay WAYLAND_DISPLAY; Zen no abrira ventana (sesion sin Wayland?)" >&2
   fi
   setsid -f "$(command -v zen-browser)" >/dev/null 2>&1 || true
   sleep 20

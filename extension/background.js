@@ -354,6 +354,106 @@ function fnMaster(cmd, a, b, c) {
       return J({ ok: true, requested: v, observed: Number(el.value), min: mn, max: mx,
                  trusted: Math.abs(Number(el.value) - v) < 1e-6 });
     }
+    case 'localstorage':
+    case 'sessionstorage': {
+      const store = cmd === 'localstorage' ? localStorage : sessionStorage;
+      const action = String(a || 'list').toLowerCase();
+      // 'list' devuelve SOLO claves. Los valores pueden ser tokens de sesion o
+      // JWT, y listarlos los exponeria de un vistazo; leerlos es una accion
+      // deliberada, uno por uno.
+      if (action === 'list') {
+        const keys = [];
+        try { for (let i = 0; i < store.length; i++) keys.push(store.key(i)); }
+        catch (e) { return J({ ok: false, error: 'no se pudo leer: ' + e.message }); }
+        return J({ ok: true, action, count: keys.length, keys });
+      }
+      if (action === 'get') {
+        if (!b) return J({ ok: false, error: 'hace falta la clave' });
+        let v = null;
+        try { v = store.getItem(b); } catch (e) { return J({ ok: false, error: e.message }); }
+        return J({ ok: true, action, key: b, found: v !== null, value: v });
+      }
+      if (action === 'set') {
+        if (!b) return J({ ok: false, error: 'hace falta la clave' });
+        try { store.setItem(b, c === undefined || c === null ? '' : String(c)); }
+        catch (e) {
+          // Cuota excedida es el fallo tipico y el error real no lo dice claro.
+          return J({ ok: false, error: 'no se pudo guardar: ' + e.message,
+                     hint: /quota/i.test(e.message) ? 'localStorage lleno (5-10MB)' : null });
+        }
+        return J({ ok: true, action, key: b });
+      }
+      if (action === 'delete') {
+        if (!b) return J({ ok: false, error: 'hace falta la clave' });
+        try { store.removeItem(b); } catch (e) { return J({ ok: false, error: e.message }); }
+        return J({ ok: true, action, key: b });
+      }
+      if (action === 'clear') {
+        try { store.clear(); } catch (e) { return J({ ok: false, error: e.message }); }
+        return J({ ok: true, action });
+      }
+      return J({ ok: false, error: 'accion desconocida: ' + action +
+                 ' (list|get|set|delete|clear)' });
+    }
+    case 'storage-clear': {
+      const r = { local: false, session: false };
+      try { localStorage.clear(); r.local = true; } catch (e) {}
+      try { sessionStorage.clear(); r.session = true; } catch (e) {}
+      return J({ ok: true, ...r });
+    }
+    case 'network': {
+      let entries = [];
+      try { entries = performance.getEntriesByType('resource'); }
+      catch (e) { return J({ ok: false, error: 'no se pudo leer: ' + e.message }); }
+      // Las URLs llevan tokens en el query string (access_token, sig, key...).
+      // Se ocultan antes de devolver nada: un log de red es justo el sitio donde
+      // un token se cuela en un archivo de texto y se comparte sin querer.
+      const SECRETS = /^(access_?token|token|key|api_?key|sig|signature|password|passwd|pwd|auth|session|sessionid|sid|jwt|bearer)$/i;
+      let redacted = 0;
+      const clean = u => {
+        try {
+          const url = new URL(u, location.href);
+          if (!url.search) return url.href;
+          let touched = false;
+          for (const k of [...url.searchParams.keys()]) {
+            if (SECRETS.test(k)) { url.searchParams.set(k, '***redacted***'); touched = true; }
+          }
+          if (touched) redacted++;
+          return url.href;
+        } catch (e) { return String(u).slice(0, 300); }
+      };
+      const kind = n => n === 'fetch' || n === 'xmlhttprequest' ? 'xhr'
+        : /\.(js|mjs|css)\b/i.test(n) ? 'asset'
+        : /\.(png|jpe?g|gif|svg|webp|avif|ico)\b/i.test(n) ? 'img'
+        : /\.(woff2?|ttf|otf|eot)\b/i.test(n) ? 'font' : n;
+      let items = entries.map(e => ({
+        url: clean(e.name),
+        kind: kind(e.initiatorType || ''),
+        status: e.responseStatus || 0,      // 0 = cacheado o no informado
+        size: e.transferSize || e.encodedBodySize || 0,
+        ms: Math.round(e.duration * 10) / 10,
+      }));
+      if (b) { const f = String(b).toLowerCase(); items = items.filter(i => i.url.toLowerCase().indexOf(f) !== -1); }
+      const cap = c ? Math.max(1, Number(c) || 50) : 50;
+      items = items.slice(-cap);   // las mas recientes
+      return J({ ok: true, total: entries.length, count: items.length, items, redacted });
+    }
+    case 'css': {
+      const el = a ? document.querySelector(a) : null;
+      if (!el) return J({ ok: false, error: 'no se encontro el selector' });
+      const cs = getComputedStyle(el);
+      const props = { color: cs.color, 'background-color': cs.backgroundColor,
+        'font-family': cs.fontFamily, 'font-size': cs.fontSize, 'font-weight': cs.fontWeight,
+        display: cs.display, position: cs.position, visibility: cs.visibility,
+        opacity: cs.opacity, width: cs.width, height: cs.height,
+        'margin-top': cs.marginTop, 'margin-bottom': cs.marginBottom,
+        'padding-top': cs.paddingTop, 'border-radius': cs.borderRadius,
+        'z-index': cs.zIndex, overflow: cs.overflow };
+      const r = el.getBoundingClientRect();
+      return J({ ok: true, selector: a, tag: el.tagName.toLowerCase(), styles: props,
+                 box: { x: Math.round(r.x), y: Math.round(r.y),
+                        w: Math.round(r.width), h: Math.round(r.height) } });
+    }
     case 'exists': {
       if (a) {
         const el = document.querySelector(a);
@@ -897,6 +997,22 @@ case "key": {
     case "locate":
     case "annotate":
     case "interactive":
+    case "localstorage":
+    case "sessionstorage":
+    case "storage-clear":
+    case "network":
+    case "css": {
+      // Estos van por fnMaster (se inyectan en la pagina): leen del DOM.
+      const tab = msg.tabId || (await activeTab()).id;
+      const out = await execFn(tab, fnMaster,
+        [msg.cmd,
+         msg.sel !== undefined ? msg.sel : (msg.text !== undefined ? msg.text : (msg.action || "")),
+         msg.text !== undefined ? msg.text : (msg.key !== undefined ? msg.key : ""),
+         msg.value !== undefined ? msg.value : msg.limit]);
+      if (!out.ok) return out;
+      return { ok: true, tabId: tab, ...JSON.parse(out.raw) };
+    }
+
     case "annotate-clear":
     case "click-at":
     case "console":
@@ -910,6 +1026,26 @@ case "key": {
          msg.nth !== undefined ? msg.nth : null]);
       if (!out.ok) return out;
       return { ok: true, tabId: tab, ...JSON.parse(out.raw) };
+    }
+
+    case "resize": {
+      // Va por browser.windows, no por el DOM: es estado del navegador, no de la
+      // pagina. Se devuelve el tamano REAL tras el cambio, no el pedido, porque
+      // el sistema puede ignorarlo (maximizar, pantallas multiples).
+      const tabId = msg.tabId != null ? msg.tabId : (await activeTab()).id;
+      try {
+        const t = await browser.tabs.get(tabId);
+        if (!t || t.windowId == null) return { ok: false, error: "la pestana no tiene ventana" };
+        const patch = {};
+        if (msg.width)  patch.width  = Math.max(320, Math.round(msg.width));
+        if (msg.height) patch.height = Math.max(240, Math.round(msg.height));
+        if (!patch.width && !patch.height) return { ok: false, error: "hace falta --width o --height" };
+        const w = await browser.windows.update(t.windowId, patch);
+        return { ok: true, tabId, windowId: t.windowId,
+                 width: w.width, height: w.height, state: w.state };
+      } catch (e) {
+        return { ok: false, error: "resize: " + String(e && e.message || e).slice(0, 180) };
+      }
     }
 
     case "back":
