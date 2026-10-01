@@ -1134,3 +1134,16 @@ case "key": {
 }
 
 connect();
+
+// Click en el icono. Con solo sidebar_action, si la extension no esta fijada en
+// la barra el icono no hace nada: el sidebar_action no registra onClicked. Un
+// action sin popup si lo hace, asi que este es el unico que responde.
+if (browser.action && browser.action.onClicked && browser.sidebarAction) {
+  browser.action.onClicked.addListener(async () => {
+    try {
+      await browser.sidebarAction.open();
+    } catch (e) {
+      console.error("zen-live: no se pudo abrir el sidebar:", e && e.message);
+    }
+  });
+}

@@ -302,6 +302,12 @@ CONTENT_TYPES = {
 
 def http_json(conn, status, payload):
     body = json.dumps(payload).encode()
+    try:
+        import sys as _s
+        _last = _s.stderr
+        print(f"[http]   -> {status}", file=_last, flush=True)
+    except Exception:
+        pass
     conn.sendall(
         f"HTTP/1.1 {status}\r\n"
         f"Content-Type: application/json; charset=utf-8\r\n"
@@ -350,7 +356,11 @@ def handle_http(server, conn):
         # comprobar sin adivinar que el panel esta hablando con la API: si no
         # aparece /api/status, el token no llego al iframe.
         if path.startswith("/api/") or os.environ.get("ZEN_LIVE_HTTP_VERBOSE"):
-            who = "ui-anon" if not headers.get("x-zen-live-token") else "ui-con-token"
+            # Loguear solo si llevaba header no prueba nada: un token
+            # equivocado tambien lo lleva. Se anota el token real (corto) y se
+            # luego refleja el status en la misma linea.
+            _h = headers.get("x-zen-live-token") or ""
+            who = ("anon" if not _h else f"tok:{_h[:6]}")
             print(f"[http] {method} {path} {who}", file=sys.stderr, flush=True)
 
         # Las paginas de /ui/ no piden token: no tienen nada sensible, solo la
