@@ -482,3 +482,114 @@ Todos los puertos escuchan **solo en loopback**. No cambiarlos a `0.0.0.0`.
 | subir un fichero a `<input type=file>` | Marionette |
 | instalar o quitar una extension | Marionette |
 
+
+## Importar recetas desde GitHub
+
+`importar-recetas` descarga recetas (Markdown) de repositorios de GitHub
+**verificando antes** que la licencia lo permite y que el contenido no lleva
+prompt injection. Pensado para no volver a escribir a mano recetas de X, Reddit
+o WhatsApp, y para que vivan en el remoto en vez de duplicadas en local.
+
+> **Verificar no es ejecutar.** El script nunca ejecuta nada de lo que
+> descarga. Las recetas son texto Markdown: se **copian**, no se ejecutan.
+> Los scripts que trae el repo (`.sh`, `.py`, `.js`, `.ts`…) no se copian ni se
+> ejecutan: se listan en el informe para que decidas tu.
+
+### Uso
+
+```bash
+# ver que pasaria SIN escribir nada (licencia + analisis de contenido)
+./importar-recetas SawyerHood/dev-browser --dry-run
+
+# importar de verdad
+./importar-recetas SawyerHood/dev-browser
+
+# solo una subruta del repo
+./importar-recetas SawyerHood/dev-browser --ruta skills/dev-browser
+
+# que hay importado, con su licencia y su scope
+./importar-recetas --list
+
+# otro destino
+./importar-recetas owner/repo --destino ~/otra/receta
+```
+
+Códigos de salida: `0` correcto · `2` error de API/repo · `3` importado con
+detecciones de prompt injection (revisa antes de usar).
+
+### Politica de licencias
+
+La licencia se lee de la **API de GitHub** (`gh api repos/OWNER/NAME/license`),
+**nunca** del badge del README ni del nombre del repo. El resultado decide:
+
+| Scope | Cuando | Que hace |
+|---|---|---|
+| `portfolio` | SPDX permisiva: MIT, Apache-2.0, BSD-2/3, ISC, 0BSD, Unlicense, CC0 | **Descarga** las recetas, con atribucion y SHA. Se pueden copiar, modificar y **redistribuir**. |
+| `personal` | Sin licencia (404 en `/license`), `NOASSERTION`, GPL/AGPL, CC-BY-NC, propietario | **NO descarga nada.** Solo registra el repo y el motivo. Uso de lectura, no redistribucion. |
+
+Sin licencia no hay permiso de copia aunque el repo sea publico y tenga 179k
+estrellas. `anthropics/skills` y `ComposioHQ/awesome-claude-skills` devuelven 404
+en `/license`: se pueden leer en GitHub, pero no se copian aqui.
+
+### Deteccion de prompt injection
+
+Cada Markdown se escanea contra 27 patrones antes de escribirse. Si aparece
+algo como *ignore previous instructions*, *envia tu token* o
+`curl … | bash`, la receta se marca en su frontmatter:
+
+```yaml
+sospechoso: si
+sospecha_severidad: critico
+sospecha: ignore-previous-instructions, exfiltrate-credentials
+activar: NO
+```
+
+y el importador sale con codigo `3` y un aviso. **No la actives** hasta leerla a
+mano.
+
+Detecciones de severidad `info` (por ejemplo «Ejecuta este comando…», que es
+prosa normal de una receta) se reportan pero **no bloquean**: marcarlas como
+sospechosas haria la herramienta inutil para recetas.
+
+### Trazabilidad
+
+Cada receta importada lleva en su frontmatter `source`, `source_url`,
+`commit_sha`, `license`, `scope`, `redistribuible` e `imported_at`. El
+manifiesto vive junto a las recetas:
+
+- `recetas/IMPORTED.json` — datos completos, por repos y por receta
+- `recetas/IMPORTED.md` — version legible, incluye los scripts no copiados
+
+Las recetas escritas a mano (las 26 de `recetas/`) no se tocan: `--list` las
+separa de las importadas.
+
+### Repos verificados (licencia via API, 2026-10-01)
+
+| Repo | Estrellas | Licencia API | Scope | Push |
+|---|---|---|---|---|
+| anthropics/skills | 179.3k | *404 — ninguna* | personal | 2026-09-29 |
+| ComposioHQ/awesome-claude-skills | 76.3k | *404 — ninguna* | personal | 2026-09-18 |
+| obra/superpowers | 293.9k | MIT | portfolio | 2026-09-27 |
+| mattpocock/skills | 273.7k | MIT | portfolio | 2026-09-29 |
+| google/skills | 20.6k | Apache-2.0 | portfolio | 2026-10-01 |
+| agentskills/agentskills | 25.8k | Apache-2.0 | portfolio | 2026-08-09 |
+| addyosmani/agent-skills | 100.3k | MIT | portfolio | 2026-09-26 |
+| vercel-labs/skills | 32.9k | MIT | portfolio | 2026-09-30 |
+| **SawyerHood/dev-browser** | 6.6k | **MIT** | **portfolio** | 2026-09-05 |
+| vercel-labs/agent-skills | 31.8k | *ninguna* | personal | 2026-08-28 |
+| apify/agent-skills | 2.4k | *ninguna* | personal | 2026-10-01 |
+| cisco-ai-defense/skill-scanner | 2.6k | NOASSERTION | personal | 2026-10-01 |
+
+`SawyerHood/dev-browser` es el mas relevante aqui: automatizacion de navegador
+para agentes, MIT y mantenido. Importado: 8 recetas; sus 77 ficheros `.ts`/`.cjs`
+se detectaron y **no** se copiaron.
+
+### Tests
+
+```bash
+./test-importar-recetas.py    # 60+ casos: detector, clasificador, licencias, e2e
+```
+
+Incluye un test de extremo a extremo con una receta que lleva prompt injection
+real: verifica que se marca `activar: NO`, que la receta limpia no se bloquea y
+que el script malicioso no se copia.

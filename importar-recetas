@@ -1,0 +1,742 @@
+#!/usr/bin/env python3
+"""
+importar-recetas — importa recetas (Markdown) desde repos de GitHub con
+verificacion de licencia y analisis de prompt injection.
+
+REGLA DE ORO: verificar no es ejecutar.
+  - Nada de lo descargado se ejecuta jamas. Ni scripts, ni hooks, ni binarios.
+  - Solo se copian ficheros de texto .md.
+  - Los scripts que trae el repo se REPORTAN, no se copian.
+  - La licencia se lee de la API de GitHub (repos/O/N/license), nunca del
+    badge del README ni del nombre del repo.
+
+Scopes:
+  portfolio -> licencia permisiva verificada (MIT/Apache-2.0/BSD/ISC...).
+                Se puede copiar, modificar y redistribuir.
+  personal  -> sin licencia, licencia no permisiva o NOASSERTION (desconocida).
+                NO se descarga el contenido. Solo queda registrado el repo.
+
+Uso:
+  ./importar-recetas SawyerHood/dev-browser
+  ./importar-recetas anthropics/skills
+  ./importar-recetas SawyerHood/dev-browser --dry-run
+  ./importar-recetas owner/repo --ruta skills/dev-browser
+  ./importar-recetas --list
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+
+DESTINO_DEFECTO = os.path.expanduser(
+    "~/.local/share/skills-hub/recetas-web/recetas"
+)
+MANIFESTO_JSON = "IMPORTED.json"
+MANIFESTO_MD = "IMPORTED.md"
+
+# Licencias que permiten redistribucion. Verificadas por la API de GitHub.
+PERMISIVAS = {
+    "MIT", "MIT-0", "APACHE-2.0", "BSD-2-CLAUSE", "BSD-3-CLAUSE",
+    "ISC", "0BSD", "UNLICENSE", "CC0-1.0", "BSL-1.0",
+}
+
+# Extensiones que NUNCA se copian (codigo ejecutable / binario).
+NO_COPIAR_EXT = {
+    ".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx",
+    ".jsx", ".rb", ".pl", ".php", ".lua", ".ps1", ".bat", ".cmd", ".exe",
+    ".dll", ".so", ".dylib", ".bin", ".jar", ".wasm", ".node",
+}
+
+# Boilerplate del repo: no son recetas, son administracion del proyecto.
+BOILERPLATE = {
+    "contributing.md", "changelog.md", "releasing.md", "code_of_conduct.md",
+    "security.md", "governance.md", "authors.md", "maintainers.md",
+    "support.md", "pull_request_template.md", "issue_template.md",
+    "codeowners", "notice",
+}
+
+# Patrones de prompt injection / instrucciones maliciosas.
+INJECTION = [
+    (r"ignore\s+(all\s+)?(previous|prior|above)\s+instructions", "ignore-previous-instructions"),
+    (r"disregard\s+(all\s+)?(previous|prior)\s+(instructions|rules)", "ignore-previous-instructions"),
+    (r"olvida\s+(todas\s+)?las\s+instrucciones", "ignore-previous-instructions"),
+    (r"ignora\s+(todas\s+)?las\s+instrucciones\s+(previas|anteriores)", "ignore-previous-instructions"),
+    (r"you\s+are\s+now\s+(a|an|in)\s+\w*\s*(dan|developer|jailbreak|root)", "role-override"),
+    (r"(new|updated)\s+instructions\s*:", "instruction-override"),
+    # NOTA: "ejecuta este comando" / "run this command" es prosa NORMAL de una receta.
+    # Se detecta y se informa, pero NO bloquea la importacion por si sola:
+    # el riesgo real es la INYECCION (redirigir al agente, exfiltrar, esconderse).
+    (r"ejecuta\s+(este|el\s+siguiente)\s+comando", "run-this-command"),
+    (r"run\s+(this|the\s+following)\s+command", "run-this-command"),
+    (r"(curl|wget)\s+[^\n|]*\|\s*(ba)?sh", "curl-pipe-shell"),
+    (r"env[ií]a\s+(tu|el)\s+(token|api[\s_-]?key|secret)", "exfiltrate-credentials"),
+    # admite posesivos: "your api key", "the user's api key", "su token"
+    (r"(send|post|upload|share|leak|env[ií]a|comparte)\s+((me\s+)?(your|the|his|her)\s+)?"
+     r"(user'?s?|tu|su|sus)?\s*"
+     r"(api[\s_-]?keys?|tokens?|secrets?|secretos?|credentials?|credenciales)",
+     "exfiltrate-credentials"),
+    (r"(your|the)\s+api[\s_-]?key\s+is", "exfiltrate-credentials"),
+    (r"api[\s_-]?key\s*[:=]\s*['\"]?[A-Za-z0-9_\-]{16,}", "hardcoded-secret"),
+    (r"gh[pousr]_[A-Za-z0-9]{20,}", "hardcoded-secret"),
+    (r"sk-[A-Za-z0-9]{20,}", "hardcoded-secret"),
+    (r"base64\s+(-d|--decode)\s*\|", "obfuscated-payload"),
+    # eval() solo es sospechoso en CONTEXTO DE EJECUCION: inicio de linea, dentro de
+    # backticks de codigo, o tras = | ; ( $ . No cuenta $eval/_eval/.eval (puppeteer)
+    # ni la palabra eval() citada en prosa documental.
+    (r"(?:(?<![$\w.\\])(?:^|[`;=|($])\s*)eval\s*\(", "obfuscated-payload"),
+    # rm -rf SOLO es peligroso contra la raiz o el home. /tmp, ~/.cache, node_modules
+    # son borrados legitimos y comunes en documentacion.
+    (r"rm\s+-rf\s+(?:--no-preserve-root\s+)?/(?:\s|$|\*)", "destructive-command"),
+    (r"rm\s+-rf\s+(?:--no-preserve-root\s+)?(?:~|\$HOME)(?:\s|$)", "destructive-command"),
+    (r"authorized_keys", "ssh-persistence"),
+    (r"~/\.ssh/id_(rsa|ed25519)", "ssh-key-access"),
+    # ocultar al usuario: variantes EN e implicitamente en ES
+    # "mention this step TO the user", "tell the user", "reveal it to the user"
+    (r"(do\s+not|don'?t|never|without)\s+[\w\s]{0,20}?"
+     r"(tell|inform|notify|mention|show|reveal|disclose)\b[\w\s]{0,20}?"
+     r"\bto\s+the\s+user\b", "hide-from-user"),
+    (r"(do\s+not|don'?t|never|without)\s+[\w\s]{0,20}?"
+     r"(tell|inform|notify|mention|show|reveal|disclose)\s+the\s+user", "hide-from-user"),
+    (r"(no\s+(le\s+|lo\s+)?(digas|diga|muestres|muestra|informes|informa|menciones|menciona|reveles|revela))",
+     "hide-from-user"),
+    (r"sin\s+(que\s+)?el\s+(usuario|user)\s+(sepa|lo\s+sepa|se\s+entere)", "hide-from-user"),
+    (r"(oculta|ocultar)\s+(esto\s+)?al\s+usuario", "hide-from-user"),
+    (r"instrucciones\s+(para|al)\s+el\s+(modelo|agente|assistant|ia)", "agent-directed"),
+]
+
+
+def ahora():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def log(msg=""):
+    print(msg, flush=True)
+
+
+def titulo(msg):
+    log()
+    log("=" * 68)
+    log(msg)
+    log("=" * 68)
+
+
+# ---------------------------------------------------------------- API GitHub
+def gh(args, check=True):
+    """Ejecuta gh CLI. Devuelve (stdout, returncode)."""
+    p = subprocess.run(
+        ["gh"] + args, capture_output=True, text=True, timeout=120
+    )
+    if check and p.returncode != 0:
+        raise RuntimeError(
+            "gh %s fallo (rc=%d): %s" % (" ".join(args[:3]), p.returncode,
+                                         (p.stderr or "").strip()[:400])
+        )
+    return p.stdout, p.returncode
+
+
+def info_repo(repo):
+    out, _ = gh(["api", "repos/" + repo, "--jq",
+                 "{full_name,stargazers_count,default_branch,archived,"
+                 "description,license:(.license.spdx_id // null)}"])
+    return json.loads(out)
+
+
+def licencia_real(repo):
+    """
+    Verifica la licencia REAL via la API. Devuelve dict:
+      spdx, name, path, found(bool), reason(str)
+    Un 404 = el repo no declara licencia -> NINGUNA.
+    NOASSERTION = la API no pudo identificarla -> desconocida, se trata
+    como no permisiva.
+    """
+    p = subprocess.run(
+        ["gh", "api", "repos/%s/license" % repo],
+        capture_output=True, text=True, timeout=60,
+    )
+    if p.returncode != 0:
+        if "404" in (p.stderr or "") or "Not Found" in (p.stderr or ""):
+            return {"spdx": "NINGUNA", "name": "NINGUNA", "path": None,
+                    "found": False,
+                    "reason": "la API /license devuelve 404: el repositorio "
+                              "no declara ninguna licencia. Sin licencia no "
+                              "hay permiso de copia ni redistribucion."}
+        return {"spdx": "ERROR", "name": "ERROR", "path": None, "found": False,
+                "reason": "error consultando la API: " + (p.stderr or "").strip()[:200]}
+
+    d = json.loads(p.stdout)
+    spdx = (d.get("license") or {}).get("spdx_id") or "NOASSERTION"
+    nombre = (d.get("license") or {}).get("name") or "desconocida"
+    if spdx in ("NOASSERTION", "NONE", None):
+        return {"spdx": "NINGUNA", "name": nombre, "path": d.get("path"),
+                "found": True,
+                "reason": "el fichero de licencia existe pero la API lo "
+                          "identifica como NOASSERTION: licencia no "
+                          "reconocible, se trata como no permisiva."}
+    return {"spdx": spdx, "name": nombre, "path": d.get("path"), "found": True,
+            "reason": ""}
+
+
+def commit_sha(repo):
+    out, _ = gh(["api", "repos/%s/commits/HEAD" % repo, "--jq",
+                 "{sha:.sha,date:.commit.committer.date}"])
+    return json.loads(out)
+
+
+# ------------------------------------------------------- Analisis de seguridad
+# Severidad por etiqueta de deteccion.
+#
+# critico/alto -> BLOQUEA la activacion: la receta queda marcada
+#                 'sospechoso: si' + 'activar: NO'.
+# info        -> se reporta pero NO bloquea. Una receta que dice
+#                 "ejecuta este comando" es documentacion normal; marcarla
+#                 como sospechosa haria la herramienta inutil para recetas.
+SEVERIDAD = {
+    "ignore-previous-instructions": "critico",
+    "role-override": "critico",
+    "instruction-override": "critico",
+    "exfiltrate-credentials": "critico",
+    "hardcoded-secret": "critico",
+    "hide-from-user": "critico",
+    "curl-pipe-shell": "critico",
+    "obfuscated-payload": "alto",
+    "destructive-command": "alto",
+    "ssh-persistence": "alto",
+    "ssh-key-access": "alto",
+    "agent-directed": "info",
+    "run-this-command": "info",
+}
+
+ORDEN_SEV = ["info", "alto", "critico"]
+
+
+def severidad_max(hits):
+    if not hits:
+        return ""
+    return max((SEVERIDAD.get(h, "alto") for h in hits), key=ORDEN_SEV.index)
+
+
+def bloqueantes(hits):
+    """Etiquetas cuya severidad bloquea la activacion."""
+    return [h for h in hits if SEVERIDAD.get(h, "alto") in ("alto", "critico")]
+
+
+def escanear(texto):
+    """Devuelve lista de etiquetas de prompt injection encontradas."""
+    bajo = texto.lower()
+    hits = []
+    for patron, etiqueta in INJECTION:
+        if re.search(patron, bajo, re.IGNORECASE):
+            if etiqueta not in hits:
+                hits.append(etiqueta)
+    return hits
+
+
+def clasificar_ficheros(rutas_relativas):
+    """
+    Separa lo copiable (texto .md) de lo que se reporta pero NO se copia.
+    Devuelve (markdown, codigo, otros, ignorados)
+    """
+    md, cod, otros, ign = [], [], [], []
+    for rel in rutas_relativas:
+        base = os.path.basename(rel)
+        partes = base.split(".")
+        ext = ("." + partes[-1].lower()) if len(partes) > 1 else ""
+        if base.upper() in ("LICENSE", "LICENCE", "COPYING"):
+            ign.append(rel)
+        elif base.lower() in BOILERPLATE:
+            ign.append(rel)
+        elif ext == ".md" or ext == ".markdown":
+            md.append(rel)
+        elif ext in NO_COPIAR_EXT:
+            cod.append(rel)
+        else:
+            otros.append(rel)
+    return md, cod, otros, ign
+
+
+def sanear_nombre(rel, prefijo):
+    """Convierte ruta relativa en nombre de fichero plano y unico."""
+    nombre = rel.replace("/", "__")
+    nombre = re.sub(r"[^A-Za-z0-9._-]", "-", nombre)
+    return prefijo + nombre.lower()
+
+
+def leer_receta(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def frontmatter(receta, meta, sospecha):
+    """Construye el frontmatter de trazabilidad."""
+    fm = []
+    fm.append("---")
+    fm.append("nombre: %s" % meta["nombre"])
+    fm.append("description: Receta importada de %s (licencia %s)" % (
+        meta["source"], meta["license"]))
+    fm.append("source: %s" % meta["source"])
+    fm.append("source_url: %s" % meta["source_url"])
+    fm.append("source_path: %s" % meta["source_path"])
+    fm.append("commit_sha: %s" % meta["commit_sha"])
+    fm.append("license: %s" % meta["license"])
+    fm.append("scope: %s" % meta["scope"])
+    fm.append("redistribuible: %s" % ("si" if meta["scope"] == "portfolio" else "no"))
+    fm.append("imported_at: %s" % meta["imported_at"])
+    fm.append("imported_by: importar-recetas")
+    if sospecha:
+        bloq = bloqueantes(sospecha)
+        fm.append("sospecha_severidad: %s" % severidad_max(sospecha))
+        fm.append("sospecha: %s" % ", ".join(sospecha))
+        if bloq:
+            fm.append("sospechoso: si")
+            fm.append("activar: NO")
+        else:
+            fm.append("sospechoso: no")
+            fm.append("nota_sospecha: deteccion informativa, no bloquea")
+    if meta["scope"] == "personal":
+        fm.append("aviso: >-")
+        fm.append("  scope personal: licencia %s. Copiado solo para uso "
+                  "privado; NO redistribuir." % meta["license"])
+    fm.append("---")
+    return "\n".join(fm) + "\n\n"
+
+
+# ------------------------------------------------------------------ Manifiesto
+def ruta_manifesto(destino):
+    return os.path.join(destino, MANIFESTO_JSON)
+
+
+def cargar_manifesto(destino):
+    p = ruta_manifesto(destino)
+    if os.path.exists(p):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {"version": 1, "repos": {}}
+    return {"version": 1, "generado_por": "importar-recetas",
+            "creado": ahora(), "repos": {}}
+
+
+def guardar_manifesto(destino, datos):
+    with open(ruta_manifesto(destino), "w", encoding="utf-8") as f:
+        json.dump(datos, f, indent=2, ensure_ascii=False, sort_keys=True)
+        f.write("\n")
+
+
+def escribir_manifesto_md(destino, datos):
+    """Version legible del manifiesto, para revision humana."""
+    L = []
+    L.append("# Recetas importadas — manifiesto")
+    L.append("")
+    L.append("Generado por `importar-recetas`. Trazabilidad completa en "
+             "`IMPORTED.json`.")
+    L.append("")
+    L.append("> Verificar no es ejecutar. Nada de lo importado se ha "
+             "ejecutado: solo se copian ficheros de texto Markdown.")
+    L.append("")
+    L.append("Actualizado: %s" % ahora())
+    L.append("")
+    for repo in sorted(datos.get("repos", {})):
+        r = datos["repos"][repo]
+        L.append("## %s" % repo)
+        L.append("")
+        L.append("- URL: %s" % r.get("source_url", ""))
+        L.append("- Licencia (API): **%s**" % r.get("license", "?"))
+        L.append("- Scope: **%s**" % r.get("scope", "?"))
+        L.append("- Redistribuible: **%s**" % ("si" if r.get("scope") == "portfolio" else "no"))
+        L.append("- Commit: `%s`" % r.get("commit_sha", "?"))
+        L.append("- Verificado: %s" % r.get("verificado_en", "?"))
+        L.append("- Estrellas: %s" % r.get("estrellas", "?"))
+        if r.get("motivo_rechazo"):
+            L.append("- Motivo de no descarga: %s" % r["motivo_rechazo"])
+        L.append("")
+        recetas = r.get("recetas", [])
+        if recetas:
+            L.append("| receta | origen | licencia | estado |")
+            L.append("|---|---|---|---|")
+            for x in recetas:
+                L.append("| `%s` | `%s` | %s | %s |" % (
+                    x.get("archivo"), x.get("source_path"),
+                    x.get("license"), x.get("estado")))
+            L.append("")
+        if r.get("scripts_no_copiados"):
+            L.append("**Scripts detectados y NO copiados** "
+                     "(no se ejecutan, no se importan):")
+            L.append("")
+            for s in r["scripts_no_copiados"][:40]:
+                L.append("- `%s`" % s)
+            if len(r["scripts_no_copiados"]) > 40:
+                L.append("- ... y %d mas" % (len(r["scripts_no_copiados"]) - 40))
+            L.append("")
+    with open(os.path.join(destino, MANIFESTO_MD), "w", encoding="utf-8") as f:
+        f.write("\n".join(L) + "\n")
+
+
+# ------------------------------------------------------------------ Descarga
+def clonar_en_temporal(repo, destino_tmp, sha):
+    """
+    Clona en un temporal. NUNCA ejecuta nada del repo:
+    git clone --no-checkout? No: necesitamos leer ficheros.
+    Usamos git init + fetch del SHA concreto (sin historial completo) y
+    checkout en modo detached. No se ejecuta ningun hook.
+    """
+    d = os.path.join(destino_tmp, "repo")
+    os.makedirs(d, exist_ok=True)
+    url = "https://github.com/%s.git" % repo
+    subprocess.run(["git", "init", "-q"], cwd=d, check=True, timeout=60)
+    subprocess.run(["git", "remote", "add", "origin", url], cwd=d, check=True,
+                   timeout=30)
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0",
+               GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath",
+               GIT_CONFIG_VALUE_0="/dev/null")
+    subprocess.run(["git", "fetch", "-q", "--depth", "1", "origin", sha],
+                   cwd=d, check=True, timeout=180, env=env)
+    subprocess.run(["git", "checkout", "-q", "--detach", "FETCH_HEAD"], cwd=d,
+                   check=True, timeout=60, env=env)
+    return d
+
+
+def listar_relativos(raiz, subruta):
+    """
+    Devuelve rutas relativas A LA SUBRUTA (no a la raiz del repo).
+    Se camina desde <raiz>/<subruta>, asi que el prefijo no hay que recortarlo:
+   doinglo mal el fichero no se encontraba al abrirlo.
+    """
+    base = os.path.join(raiz, subruta.rstrip("/")) if subruta else raiz
+    if not os.path.isdir(base):
+        raise RuntimeError("la ruta %r no existe en el repositorio" % subruta)
+    out = []
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [x for x in dirnames if x not in (".git", "node_modules")]
+        for fn in filenames:
+            full = os.path.join(dirpath, fn)
+            out.append(os.path.relpath(full, base))
+    return sorted(out)
+
+
+# --------------------------------------------------------------------- Flujo
+def importar(args):
+    repo = args.repo
+    destino = os.path.expanduser(args.destino)
+    dry = args.dry_run
+
+    titulo("importar-recetas %s%s" % (repo, "  [DRY-RUN, no se escribe nada]" if dry else ""))
+
+    # --- 1. Existencia del repo
+    log("[1/5] Verificando que el repo existe...")
+    try:
+        rinfo = info_repo(repo)
+    except Exception as e:
+        log("  ERROR: %s" % e)
+        return 2
+    log("  repo     : %s" % rinfo["full_name"])
+    log("  estrellas: %s" % rinfo["stargazers_count"])
+    log("  branch   : %s" % rinfo["default_branch"])
+    log("  archivado: %s" % rinfo["archived"])
+    if rinfo.get("description"):
+        log("  desc     : %s" % rinfo["description"][:100])
+    if rinfo["archived"]:
+        log("  AVISO: el repositorio esta archivado. Sin mantenimiento.")
+
+    # --- 2. Licencia REAL (API, no badge)
+    log()
+    log("[2/5] Verificando licencia REAL via API (gh api repos/%s/license)..." % repo)
+    lic = licencia_real(repo)
+    log("  endpoint  : repos/%s/license" % repo)
+    log("  SPDX      : %s" % lic["spdx"])
+    log("  nombre    : %s" % lic["name"])
+    log("  fichero   : %s" % (lic["path"] or "(ninguno)"))
+    if lic["spdx"] in PERMISIVAS:
+        scope = "portfolio"
+        log("  VEREDICTO : PERMISIVA -> scope=portfolio, redistribuible=sí")
+    else:
+        scope = "personal"
+        log("  VEREDICTO : NO PERMISIVA -> scope=personal")
+        log("  MOTIVO    : %s" % lic["reason"])
+
+    sha_info = commit_sha(repo)
+    sha = sha_info["sha"]
+    log("  commit    : %s (%s)" % (sha[:12], sha_info["date"]))
+
+    datos = cargar_manifesto(destino)
+
+    # --- 3. Gate de licencia: sin permiso no se descarga NADA
+    if scope != "portfolio":
+        titulo("DESCARGA RECHAZADA — sin licencia permisiva")
+        log("El contenido de %s NO se ha descargado." % repo)
+        log("Solo se registra el repo con scope=personal y el motivo.")
+        log("Para usar sus recetas consulta el repo directamente en GitHub")
+        log("como material de lectura; no se copia nada a local.")
+        if not dry:
+            datos["repos"][repo] = {
+                "source": repo,
+                "source_url": "https://github.com/%s" % repo,
+                "license": lic["spdx"],
+                "license_nombre": lic["name"],
+                "scope": "personal",
+                "redistribuible": False,
+                "motivo_rechazo": lic["reason"],
+                "commit_sha": sha,
+                "estrellas": rinfo["stargazers_count"],
+                "verificado_en": ahora(),
+                "recetas": [],
+                "scripts_no_copiados": [],
+            }
+            os.makedirs(destino, exist_ok=True)
+            guardar_manifesto(destino, datos)
+            escribir_manifesto_md(destino, datos)
+            log()
+            log("Manifesto actualizado: %s" % ruta_manifesto(destino))
+        else:
+            log()
+            log("[dry-run] No se ha escrito nada.")
+        return 0
+
+    # --- 4. Clonar a temporal y analizar (sin ejecutar)
+    log()
+    log("[3/5] Clonando a directorio temporal (nada se ejecuta)...")
+    tmp = tempfile.mkdtemp(prefix="importar-recetas-")
+    try:
+        raiz = clonar_en_temporal(repo, tmp, sha)
+        # base = directorio REAL desde el que se leen los ficheros. Con --ruta
+        # las rutas relativas son a la subruta, asi que hay que anteponerla.
+        base = os.path.join(raiz, args.ruta.rstrip("/")) if args.ruta else raiz
+        rel = listar_relativos(raiz, args.ruta)
+        md, cod, otros, ign = clasificar_ficheros(rel)
+        log("  temporal  : %s (se borra al salir)" % tmp)
+        log("  ficheros  : %d totales" % len(rel))
+        log("  markdown  : %d copiables" % len(md))
+        log("  codigo    : %d NO copiados (se reportan)" % len(cod))
+        log("  otros     : %d" % len(otros))
+        log("  boilerplate: %d omitidos (no son recetas)" % len(ign))
+
+        if cod:
+            log()
+            log("  Scripts/binarios detectados — NO se copian, NO se ejecutan:")
+            for c in cod[:25]:
+                log("    - %s" % c)
+            if len(cod) > 25:
+                log("    ... y %d mas" % (len(cod) - 25))
+
+        if not md:
+            log()
+            log("  No hay ficheros Markdown que importar.")
+
+        log()
+        log("[4/5] Analizando %d Markdown(s) con %d patrones de prompt injection..."
+            % (len(md), len(INJECTION)))
+        analisis = []
+        for rel_path in md:
+            texto = leer_receta(os.path.join(base, rel_path))
+            hits = escanear(texto)
+            destino_nombre = sanear_nombre(rel_path, args.prefijo)
+            analisis.append({
+                "rel": rel_path, "texto": texto, "hits": hits,
+                "archivo": destino_nombre, "sha256": hashlib.sha256(
+                    texto.encode("utf-8")).hexdigest()[:16],
+            })
+            if not hits:
+                estado = "LIMPIO"
+            elif bloqueantes(hits):
+                estado = "SOSPECHOSO/%s (%s)  -> NO activar" % (
+                    severidad_max(hits), ", ".join(hits))
+            else:
+                estado = "INFO (%s)  -> no bloquea" % ", ".join(hits)
+            log("    %-45s %s" % (rel_path[:45], estado))
+
+        # --- 5. Importar
+        log()
+        if dry:
+            log("[5/5] DRY-RUN: se importarian %d receta(s) en:" % len(analisis))
+            log("      %s" % destino)
+            for a in analisis:
+                marca = " [SOSPECHOSO: NO activar]" if a["hits"] else ""
+                log("      - %s  <- %s%s" % (a["archivo"], a["rel"], marca))
+            log()
+            log("No se ha escrito nada en disco.")
+            return 0
+
+        log("[5/5] Escribiendo en %s ..." % destino)
+        os.makedirs(destino, exist_ok=True)
+        recetas_meta = []
+        sospechosas = 0
+        for a in analisis:
+            nombre = re.sub(r"\.md$", "", a["archivo"])
+            fmeta = {
+                "nombre": nombre,
+                "source": repo,
+                "source_url": "https://github.com/%s/blob/%s/%s%s" % (
+                    repo, sha, args.ruta.rstrip("/") + "/" if args.ruta else "", a["rel"]),
+                "source_path": a["rel"],
+                "commit_sha": sha,
+                "license": lic["spdx"],
+                "scope": scope,
+                "imported_at": ahora(),
+            }
+            cabecera = frontmatter(None, fmeta, a["hits"])
+            cuerpo = a["texto"]
+            if cuerpo.startswith("---\n"):
+                # conserva el frontmatter original bajo el nuevo
+                fin = cuerpo.find("\n---", 4)
+                if fin != -1:
+                    cuerpo = cuerpo[fin + 4:].lstrip("\n")
+            destino_final = os.path.join(destino, a["archivo"])
+            with open(destino_final, "w", encoding="utf-8") as f:
+                f.write(cabecera)
+                f.write("<!-- importado de %s@%s | licencia %s | %s -->\n\n"
+                        % (repo, sha[:12], lic["spdx"], ahora()))
+                f.write(cuerpo)
+            estado = "importada"
+            if bloqueantes(a["hits"]):
+                estado = "importada-SOSPECHOSA (no activar)"
+                sospechosas += 1
+            elif a["hits"]:
+                estado = "importada (info: %s)" % ", ".join(a["hits"])
+            log("    escrito: %s  [%s]" % (a["archivo"], estado))
+            recetas_meta.append({
+                "archivo": a["archivo"],
+                "source_path": (args.ruta.rstrip("/") + "/" + a["rel"]) if args.ruta else a["rel"],
+                "source_url": fmeta["source_url"], "license": lic["spdx"],
+                "scope": scope, "estado": estado,
+                "sha256_16": a["sha256"], "imported_at": fmeta["imported_at"],
+                "sospecha": a["hits"],
+                "sospecha_severidad": severidad_max(a["hits"]),
+                "bloqueada": bool(bloqueantes(a["hits"])),
+            })
+
+        datos["repos"][repo] = {
+            "source": repo,
+            "source_url": "https://github.com/%s" % repo,
+            "license": lic["spdx"],
+            "license_nombre": lic["name"],
+            "scope": scope,
+            "redistribuible": True,
+            "motivo_rechazo": "",
+            "commit_sha": sha,
+            "commit_fecha": sha_info["date"],
+            "estrellas": rinfo["stargazers_count"],
+            "verificado_en": ahora(),
+            "subruta": args.ruta or "(raiz)",
+            "recetas": recetas_meta,
+            "scripts_no_copiados": cod,
+        }
+        guardar_manifesto(destino, datos)
+        escribir_manifesto_md(destino, datos)
+        log()
+        log("Manifiestos actualizados:")
+        log("  %s" % ruta_manifesto(destino))
+        log("  %s" % os.path.join(destino, MANIFESTO_MD))
+        if sospechosas:
+            titulo("ALERTA DE SEGURIDAD: %d receta(s) SOSPECHOSA(S)" % sospechosas)
+            log("Marcadas con 'sospechoso: si' y 'activar: NO' en el frontmatter.")
+            log("NO las uses como instrucciones hasta revisarlas a mano.")
+            return 3
+        log()
+        log("Importacion limpia: %d receta(s), ninguna sospechosa." % len(recetas_meta))
+        return 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        log()
+        log("[limpieza] temporal eliminado.")
+
+
+# ----------------------------------------------------------------------- List
+def listar(args):
+    destino = os.path.expanduser(args.destino)
+    titulo("Recetas importadas en %s" % destino)
+    datos = cargar_manifesto(destino)
+    repos = datos.get("repos", {})
+    if not repos:
+        log("No hay repos importados todavia.")
+        log("Usa:  ./importar-recetas owner/repo")
+        return 0
+    log("%-32s %-14s %-11s %-7s %s" % ("REPO", "LICENCIA", "SCOPE", "REDIST", "RECETAS"))
+    log("-" * 68)
+    total = 0
+    for repo in sorted(repos):
+        r = repos[repo]
+        n = len(r.get("recetas", []))
+        total += n
+        marcas = []
+        for x in r.get("recetas", []):
+            if x.get("bloqueada") or x.get("sospecha"):
+                marcas.append(x["archivo"] + "  [%s]" % (
+                    x.get("sospecha_severidad") or "sospecha"))
+        log("%-32s %-14s %-11s %-7s %d%s" % (
+            repo[:32], r.get("license", "?"), r.get("scope", "?"),
+            "si" if r.get("redistribuible") else "no", n,
+            "  [rechazado: sin licencia]" if r.get("motivo_rechazo") else ""))
+        if r.get("motivo_rechazo"):
+            log("    motivo: %s" % r["motivo_rechazo"][:110])
+    log("-" * 68)
+    log("Total recetas importadas: %d" % total)
+    log("Repos registrados:       %d" % len(repos))
+    if marcas:
+        log("Detecciones de prompt injection (no activar): %d" % len(marcas))
+        for m in marcas:
+            log("    - %s" % m)
+
+    # recetas escritas a mano (sin provenance de importacion)
+    try:
+        locales = []
+        for fn in sorted(os.listdir(destino)):
+            if not fn.endswith(".md") or fn == MANIFESTO_MD:
+                continue
+            p = os.path.join(destino, fn)
+            if not os.path.isfile(p):
+                continue
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                head = f.read(1200)
+            if "imported_by: importar-recetas" not in head:
+                locales.append(fn)
+        if locales:
+            log()
+            log("Recetas escritas a mano (no importadas): %d" % len(locales))
+            for fn in locales:
+                log("    - %s" % fn)
+    except FileNotFoundError:
+        pass
+    return 0
+
+
+# ---------------------------------------------------------------------- Main
+def main():
+    p = argparse.ArgumentParser(
+        prog="importar-recetas",
+        description="Importa recetas Markdown desde GitHub verificando "
+                    "licencia real y prompt injection. No ejecuta nada.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("repo", nargs="?", help="owner/name del repo de GitHub")
+    p.add_argument("--ruta", "-r", default="",
+                   help="subruta dentro del repo (por defecto: todo el repo)")
+    p.add_argument("--destino", "-d", default=DESTINO_DEFECTO,
+                   help="directorio de recetas (def: %s)" % DESTINO_DEFECTO)
+    p.add_argument("--prefijo", default="imported__",
+                   help="prefijo de los ficheros importados")
+    p.add_argument("--dry-run", action="store_true",
+                   help="verifica y muestra lo que haria SIN escribir nada")
+    p.add_argument("--list", "-l", action="store_true",
+                   help="lista lo ya importado con licencia y scope")
+    a = p.parse_args()
+
+    if a.list:
+        return listar(a)
+    if not a.repo:
+        p.print_help()
+        return 1
+    if "/" not in a.repo:
+        log("ERROR: el repo debe tener forma owner/name (ej: SawyerHood/dev-browser)")
+        return 1
+    return importar(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -6,3 +6,7 @@ extension/background.js.bak*
 *.bak
 *.bak2
 *.bak3
+
+# Cache de Python de las pruebas.
+__pycache__/
+*.pyc
