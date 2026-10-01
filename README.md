@@ -455,8 +455,7 @@ cubre lo que el otro no puede.
 
 **Por que hace falta Marionette.** Hay capacidades que no existen para una
 WebExtension, no que sean complicadas: `window.alert()` y `confirm()` no se
-exponen a las extensiones, `DOM.setFileInputFiles` es CDP puro, y no hay API
-a las extensiones, `DOM.setFileInputFiles` es CDP puro, y no hay API para
+exponen a las extensiones, `DOM.setFileInputFiles` es CDP puro, y no hay API para
 instalar una extension sin consentimiento del usuario. Marionette las resuelve
 porque controla el navegador por dentro.
 resuelve porque controla el navegador por dentro.
