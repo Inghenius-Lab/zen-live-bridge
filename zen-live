@@ -15,6 +15,8 @@ Uso:
   zen-live js 'EXPRESION'             evalua JS en la pestanya activa
   zen-live shot NOMBRE                captura PNG a /tmp/zen-shot/NOMBRE.png
   zen-live cookies [URL]              cookies de un sitio (por defecto el activo)
+  zen-live scroll [PX] [--dir up|down] [--sel CSS] [--wait MS]
+                                     scrollea la pestanya activa y reporta el delta
   zen-live close TABID                cierra una pestanya (las del agente, no las tuyas)
 
 Requiere: la extension "Zen Live Bridge" cargada en Zen (about:debugging o
@@ -237,6 +239,16 @@ def main():
             payload["cookieStoreId"] = sys.argv[sys.argv.index("--cookie-store") + 1]
         r = send(payload)
         print(json.dumps(r, ensure_ascii=False, indent=2))
+        return
+
+    if cmd == "scroll":
+        a = sys.argv
+        px = int(a[a.index("--px") + 1]) if "--px" in a else 1200
+        direction = a[a.index("--dir") + 1] if "--dir" in a else "down"
+        sel = a[a.index("--sel") + 1] if "--sel" in a else ""
+        wait = int(a[a.index("--wait") + 1]) if "--wait" in a else 900
+        r = send({"cmd": "scroll", "px": px, "dir": direction, "sel": sel, "wait": wait})
+        print(json.dumps(r, ensure_ascii=False))
         return
 
     if cmd == "focus":

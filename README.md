@@ -22,6 +22,7 @@ zen-live status            # estado del puente y la extensión
 zen-live tabs              # lista pestañas reales
 zen-live goto URL [--new]  # abre pestaña en background (no roba foco)
 zen-live text | snap       # lee texto / interactivos con selectores
+zen-live scroll [PX] [--dir up|down] [--sel CSS] [--wait MS]  # scroll; reporta delta
 zen-live click --sel CSS   # clic real
 zen-live fill --sel CSS --value V [--submit]
 zen-live js 'expr'         # evalúa JS en la pestaña activa

@@ -59,6 +59,7 @@ zen-live js 'EXPR' --allow-eval
 zen-live shot captura
 zen-live cookies https://x.com
 zen-live list-containers
+zen-live scroll [PX] [--dir up|down] [--sel CSS] [--wait MS]  # v0.5.0+
 zen-live focus [tabId]
 zen-live reload-ext
 zen-live close 12
@@ -87,6 +88,33 @@ cp /tmp/zen-live-bridge-X.Y.Z.xpi ~/.hermes/skills/zen-live-bridge/extension/
 **Endpoint canónico**: `~/.local/share/skills-hub/zen-live-bridge/scripts/zen-live-bridge.py` (skills-hub, no pi). Los otros 2 lugares son symlinks.
 
 **RAM**: el servicio NO es on-demand, es always-on. Está en la lista de exclusiones de ram-watchdog (ver `~/.local/bin/ram-watchdog.sh`). Si alguna optimización lo mata, systemd lo respawna auto en 3s.
+
+
+### `scroll` (v0.5.0, 2026-10-01) — leer paginas largas y feeds
+
+**Bug que lo motivó**: `zen-live scroll N` imprimía el HELP y salía con 0. Un
+agente que no mire la salida puede creerse que funcionó. Resultado: no había
+forma de leer páginas largas ni feeds de SPA (X, LinkedIn) con scroll infinito.
+
+```bash
+zen-live scroll 2500                 # baja 2500px, espera 900ms
+zen-live scroll 2500 --wait 2000     # SPAs lentas (X)
+zen-live scroll --sel "article:nth-of-type(20)"   # a un elemento concreto
+zen-live scroll --dir up
+```
+
+**Siempre comprobar el campo `delta`**: si es 0, la página no avanzó (fin del
+feed, o el scroll no aplicó). Reporta `before`, `after`, `delta`, `height`.
+
+### Reiniciar Zen tras instalar la extensión
+
+El proceso real se llama **`zen-bin`**, no `zen`. `pkill -x zen` no mata nada y
+da la falsa impresión de haber cerrado el navegador. Comprobar siempre con
+`pgrep -af zen-bin`.
+
+Y si Zen no relanza desde el shell del agente (`niri msg` falla con *"error
+connecting to the niri socket"*): el socket de niri **no es alcanzable desde el
+backend SSH**. No reintentar en bucle — pedirle al usuario que abra Zen.
 
 ## Reglas
 - **Nunca cerrar pestañas del usuario** a no ser que él lo pida; cerrar solo las

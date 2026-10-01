@@ -77,6 +77,23 @@ function fnSnap(limit) {
   })).filter(x => x.text || x.tag === 'input' || x.tag === 'textarea');
   return JSON.stringify({ text, els });
 }
+function fnScroll(px, dir, sel, waitMs) {
+  const before = window.scrollY;
+  if (sel) {
+    const el = document.querySelector(sel);
+    if (el) { el.scrollIntoView({ block: dir === 'up' ? 'start' : 'end', behavior: 'smooth' }); }
+  } else {
+    window.scrollBy({ top: (dir === 'up' ? -1 : 1) * Math.abs(px), behavior: 'smooth' });
+  }
+  // SPA: X/LinkedIn cargan por scroll, hay que dar tiempo al render
+  return new Promise(resolve => setTimeout(() => {
+    resolve(JSON.stringify({
+      ok: true, before, after: window.scrollY,
+      delta: window.scrollY - before,
+      height: document.body.scrollHeight
+    }));
+  }, waitMs));
+}
 function fnClick(sel, txt) {
   let el = null;
   if (sel) el = document.querySelector(sel);
@@ -401,6 +418,14 @@ async function handle(msg) {
       if (!out.ok) return out;
       const parsed = JSON.parse(out.raw);
       return { ok: true, tabId: tab.id, title: tab.title, url: tab.url, ...parsed };
+    }
+
+
+    case "scroll": {
+      const tab = msg.tabId || (await activeTab()).id;
+      const out = await execFn(tab, fnScroll, [msg.px || 1200, msg.dir || "down", msg.sel || "", msg.wait || 900]);
+      if (!out.ok) return out;
+      return { ok: true, tabId: tab, ...JSON.parse(out.raw) };
     }
 
     case "click": {
