@@ -1,0 +1,8 @@
+# Empaquetados: el .xpi lleva el token incrustado dentro.
+*.xpi
+
+# Nunca debe entrar un token al repositorio.
+extension/background.js.bak*
+*.bak
+*.bak2
+*.bak3

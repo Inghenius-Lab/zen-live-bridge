@@ -25,6 +25,20 @@ instalada). Sin extension, ping falla con mensaje claro.
 import base64, json, os, socket, subprocess, sys, time
 from sys import argv
 
+TOKEN_FILE = os.path.expanduser(
+    os.environ.get("ZEN_LIVE_TOKEN_FILE", "~/.local/state/zen-live-bridge/token"))
+
+
+def load_token():
+    """Token del puente. Se lee en cada envio, asi que rotar el archivo basta
+    y no hay que reinstalar el CLI."""
+    try:
+        with open(TOKEN_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 TCP_PORT = int(os.environ.get("ZEN_LIVE_TCP", "8790"))  # 8787 = stt-server (canonico ecosistema)
 WS_PORT = int(os.environ.get("ZEN_LIVE_WS", "8788"))
 BRIDGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zen-live-bridge.py")
@@ -36,7 +50,7 @@ def send(cmd, timeout=120):
     except OSError as e:
         return {"ok": False, "error": f"puente caido: {e}. Arranca con 'zen-live serve'"}
     try:
-        s.sendall((json.dumps(cmd) + "\n").encode())
+        s.sendall((json.dumps(dict(cmd, token=load_token())) + "\n").encode())
         s.settimeout(timeout + 10)
         buf = b""
         while b"\n" not in buf:

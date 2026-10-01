@@ -10,10 +10,47 @@ reenvia comandos con id y devuelve las respuestas al agente que los pidio.
 Zero dependencias: WS implementado a mano (RFC 6455, frames texto, payload
 hasta 64-bit). Solo escucha en 127.0.0.1.
 """
-import base64, hashlib, json, os, socket, struct, sys, threading, time
+import base64, hashlib, hmac, json, os, secrets, socket, struct, sys, threading, time
 
 TCP_PORT = int(os.environ.get("ZEN_LIVE_TCP", "8790"))  # 8787 = stt-server (canonico ecosistema)
 WS_PORT = int(os.environ.get("ZEN_LIVE_WS", "8788"))
+TOKEN_FILE = os.path.expanduser(
+    os.environ.get("ZEN_LIVE_TOKEN_FILE", "~/.local/state/zen-live-bridge/token"))
+
+
+def load_or_make_token():
+    """Token compartido entre puente, CLI y extension.
+
+    Que protege y que NO, para no creerse mas de lo que es:
+      - SI: paginas web (no pueden leer un archivo 0600), otros usuarios de la
+        misma maquina, y conexiones accidentales.
+      - NO: un proceso que ya corre como este usuario, porque puede leer el
+        archivo del token igual que cualquier otra cosa. Contra eso ningun
+        secreto en disco sirve; haria falta aislamiento o un socket con
+        permisos de usuario.
+    """
+    try:
+        with open(TOKEN_FILE) as f:
+            t = f.read().strip()
+            if t:
+                return t
+    except FileNotFoundError:
+        pass
+    d = os.path.dirname(TOKEN_FILE)
+    if d:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    t = secrets.token_urlsafe(32)
+    fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(t + "\n")
+    return t
+
+
+def token_ok(candidate, expected=None):
+    exp = expected if expected is not None else load_or_make_token()
+    if not candidate or not exp:
+        return False
+    return hmac.compare_digest(str(candidate), str(exp))
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 class WsClient:
@@ -64,6 +101,7 @@ class WsClient:
 
 class WsServer:
     def __init__(self):
+        self.token = load_or_make_token()
         self.lock = threading.Lock()
         self.client = None          # conexion WS activa de la extension
         self.pending = {}           # id -> threading.Event + resultado
@@ -103,11 +141,35 @@ class WsServer:
             if not chunk:
                 raise ConnectionError("no request")
             data += chunk
+        request_line = data.decode("latin1").split("\r\n")[0]
         headers = {}
         for line in data.decode("latin1").split("\r\n")[1:]:
             if ":" in line:
                 k, v = line.split(":", 1)
                 headers[k.strip().lower()] = v.strip()
+
+        # Token en la query del path: /?t=TOKEN
+        # Ojo: request_line es "GET /?t=TOKEN HTTP/1.1". Partirlo por "?"
+        # deja "t=TOKEN HTTP/1.1", o sea el token con el codigo HTTP pegado y
+        # la comparacion falla siempre. Hay que quedarse con el path primero.
+        path = request_line.split(" ")[1] if " " in request_line else request_line
+        got = ""
+        if "?" in path:
+            for pair in path.split("?", 1)[1].split("&"):
+                if pair.startswith("t="):
+                    got = pair[2:]
+        if not token_ok(got):
+            conn.sendall(b"HTTP/1.1 401 Unauthorized\r\n\r\n")
+            raise ConnectionError("token invalido")
+
+        # Solo la extension puede conectarse. Una pagina web que intentara
+        # ws://127.0.0.1:8788 mandaria su propio Origin y se rechaza. Es
+        # defensa en profundidad: el token ya la frena.
+        origin = headers.get("origin", "")
+        if origin and not origin.startswith("moz-extension://"):
+            conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            raise ConnectionError("origin no permitido")
+
         key = headers.get("sec-websocket-key", "")
         accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
         conn.sendall(
@@ -198,6 +260,14 @@ def handle_tcp_conn(server, conn):
                     cmd = json.loads(line.decode())
                 except Exception as e:
                     conn.sendall((json.dumps({"ok": False, "error": f"json: {e}"}) + "\n").encode())
+                    continue
+                if not token_ok(cmd.get("token"), server.token):
+                    conn.sendall((json.dumps({
+                        "ok": False,
+                        "error": "token invalido. Rotalo con: rm ~/.local/state/zen-live-bridge/token "
+                                  "&& zen-live serve && ./package.sh --restart-zen",
+                    }) + "\n").encode())
+                    continue
                     continue
                 if cmd.get("cmd") == "shutdown":
                     result = {"ok": True, "bye": True}

@@ -6,7 +6,11 @@
    puente (cada 5s) + alarma de respaldo para reconectar. */
 "use strict";
 
-const WS_URL = "ws://127.0.0.1:8788";
+// El token lo inyecta package.sh al empaquetar: una WebExtension no puede
+// leer archivos locales, asi que el secreto tiene que ir incrustado en el codigo
+// empaquetado. Por eso __ZEN_LIVE_TOKEN__ NUNCA se commitea (ver .gitignore)
+// y por eso rotarlo exige re-empaquetar, no solo reiniciar.
+const WS_URL = "ws://127.0.0.1:8788/?t=__ZEN_LIVE_TOKEN__";
 let ws = null;
 let timer = null;
 
