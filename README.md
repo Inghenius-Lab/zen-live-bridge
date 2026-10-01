@@ -454,9 +454,10 @@ cubre lo que el otro no puede.
 | `127.0.0.1:8790` | TCP del CLI | lo que usan los agentes |
 
 **Por que hace falta Marionette.** Hay capacidades que no existen para una
-WebExtension, no que sean_difficiles_: `window.alert()` y `confirm()` no se
-exponen a las extensiones, `DOM.setFileInputFiles` es CDP puro, y no hay API
-para instalar una extension sin consentimiento del usuario. Marionette las
+WebExtension, no que sean complicadas
+a las extensiones, `DOM.setFileInputFiles` es CDP puro, y no hay API para
+instalar una extension sin consentimiento del usuario. Marionette las resuelve
+porque controla el navegador por dentro.
 resuelve porque controla el navegador por dentro.
 
 ### `--marionette` es obligatorio
