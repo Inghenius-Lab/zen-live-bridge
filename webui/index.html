@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Zen Live</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span id="dot" class="dot"></span>
+    <strong>Zen Live</strong>
+    <span id="ver" class="ver"></span>
+  </div>
+  <div class="acts">
+    <button id="btn-annotate" title="Numerar elementos interactivos">Anotar</button>
+    <button id="btn-clear" title="Quitar anotaciones">Limpiar</button>
+    <button id="btn-refresh" title="Releer">↻</button>
+  </div>
+</header>
+
+<section id="now" class="card">
+  <div class="tabsel">
+    <select id="tabs"></select>
+  </div>
+  <div id="meta" class="meta">—</div>
+</section>
+
+<nav class="nav">
+  <button data-go="back" title="Atras">←</button>
+  <button data-go="reload" title="Recargar">⟳</button>
+  <button data-go="forward" title="Adelante">→</button>
+  <span class="grow"></span>
+  <button data-go="scroll-dn" title="Bajar">↓</button>
+  <button data-go="scroll-up" title="Subir">↑</button>
+</nav>
+
+<section class="card growcard">
+  <h2>Elementos interactivos <span id="count" class="pill">0</span></h2>
+  <div id="elements" class="elements"><p class="empty">Pulsa <em>Anotar</em> para numerar la pagina.</p></div>
+</section>
+
+<section class="card">
+  <h2>Texto</h2>
+  <pre id="text" class="text">—</pre>
+</section>
+
+<div id="log"></div>
+<script src="app.js"></script>
+</body>
+</html>

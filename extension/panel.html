@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Zen Live</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #14161a; }
+  body { display: flex; flex-direction: column; }
+  #bar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 6px 9px;
+         background: #1b1e24; border-bottom: 1px solid #2a2f37; color: #e6e9ee;
+         font: 12px system-ui, sans-serif; }
+  #bar b { font-size: 12px; }
+  #bar span { color: #9aa3b0; font: 11px ui-monospace, monospace; }
+  #bar a { margin-left: auto; color: #7aa2f7; cursor: pointer; text-decoration: none; font-size: 11px; }
+  iframe { flex: 1; border: 0; width: 100%; }
+  #err { display: none; padding: 9px; color: #f77a7a; font: 12px ui-monospace, monospace; }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <b>Zen Live</b><span id="st">cargando…</span>
+    <a id="open" title="Abrir la UI en una pestana">abrir ↗</a>
+  </div>
+  <iframe id="ui" src="http://127.0.0.1:8789/ui/"></iframe>
+  <div id="err"></div>
+<script src="panel.js"></script>
+</body>
+</html>

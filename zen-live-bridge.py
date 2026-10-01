@@ -268,7 +268,6 @@ def handle_tcp_conn(server, conn):
                                   "&& zen-live serve && ./package.sh --restart-zen",
                     }) + "\n").encode())
                     continue
-                    continue
                 if cmd.get("cmd") == "shutdown":
                     result = {"ok": True, "bye": True}
                 else:
@@ -284,15 +283,163 @@ def handle_tcp_conn(server, conn):
     finally:
         conn.close()
 
+# ---------------------------------------------------------------- UI local
+# Sirve la web de /ui/ y una API que relayea contra la extension por el WS.
+# Puerto aparte del TCP de linea-JSON a proposito: mezclar dos protocolos en el
+# mismo puerto obliga a sniffear los primeros bytes y es fragil de mantener.
+HTTP_PORT = int(os.environ.get("ZEN_LIVE_HTTP", "8789"))
+WEBUI_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webui")
+
+CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".json": "application/json; charset=utf-8",
+}
+
+
+def http_json(conn, status, payload):
+    body = json.dumps(payload).encode()
+    conn.sendall(
+        f"HTTP/1.1 {status}\r\n"
+        f"Content-Type: application/json; charset=utf-8\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n".encode() + body)
+
+
+def read_http(conn, limit=1 << 20):
+    """Lee method + path + headers + body. Suficiente para /api/cmd con JSON."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = conn.recv(65536)
+        if not chunk:
+            return None, None, {}, b""
+        buf += chunk
+        if len(buf) > limit:
+            return None, None, {}, b""
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    lines = head.decode("latin1").split("\r\n")
+    parts = (lines[0].split(" ") + ["", "", ""])[:3]
+    method, path = parts[0], parts[1]
+    headers = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    n = int(headers.get("content-length", "0") or 0)
+    body = rest
+    while len(body) < n:
+        chunk = conn.recv(65536)
+        if not chunk:
+            break
+        body += chunk
+    return method, path, headers, body
+
+
+def handle_http(server, conn):
+    conn.settimeout(30)
+    try:
+        method, path, headers, body = read_http(conn)
+        if method is None:
+            return
+
+        # Log de acceso minimo. Sirve para depurar, y sobre todo para
+        # comprobar sin adivinar que el panel esta hablando con la API: si no
+        # aparece /api/status, el token no llego al iframe.
+        if path.startswith("/api/") or os.environ.get("ZEN_LIVE_HTTP_VERBOSE"):
+            who = "ui-anon" if not headers.get("x-zen-live-token") else "ui-con-token"
+            print(f"[http] {method} {path} {who}", file=sys.stderr, flush=True)
+
+        # Las paginas de /ui/ no piden token: no tienen nada sensible, solo la
+        # maquetacion. El token se exige en /api/, que es lo unico que manda
+        # algo al navegador. Asi una pagina cualquiera que iframee /ui/ no
+        # obtiene nada, y la UI carga sinTTP credentials inline.
+        if path.startswith("/api/"):
+            if not token_ok(headers.get("x-zen-live-token"), server.token):
+                http_json(conn, "401 Unauthorized", {"ok": False, "error": "token invalido"})
+                return
+
+            if path == "/api/status":
+                r = server.send_command({"cmd": "ping"}, timeout=8)
+                http_json(conn, "200 OK", {
+                    "ok": True,
+                    "extension": bool(r.get("ok")),
+                    "version": r.get("version", ""),
+                    "http_port": HTTP_PORT,
+                })
+                return
+
+            if path == "/api/cmd" and method == "POST":
+                try:
+                    req = json.loads(body or b"{}")
+                except Exception as e:
+                    http_json(conn, "400 Bad Request", {"ok": False, "error": f"json: {e}"})
+                    return
+                t = req.get("timeout", 30)
+                result = server.send_command({**req, "timeout": t}, timeout=t)
+                http_json(conn, "200 OK", result if isinstance(result, dict) else {"ok": True})
+                return
+
+            http_json(conn, "404 Not Found", {"ok": False, "error": f"ruta no existe: {path}"})
+            return
+
+        # ---- archivos estaticos de la UI ----
+        if path in ("/", "/ui", "/ui/"):
+            path = "/ui/index.html"
+        rel = path.lstrip("/")
+        if rel.startswith("ui/"):
+            rel = rel[3:]
+        root = os.path.normpath(WEBUI_DIR)
+        # Sin esta comprobacion, un ../../etc/passwd sale del directorio.
+        full = os.path.normpath(os.path.join(root, rel))
+        if not full.startswith(root):
+            http_json(conn, "403 Forbidden", {"ok": False, "error": "fuera del directorio de la UI"})
+            return
+        if not os.path.isfile(full):
+            http_json(conn, "404 Not Found", {"ok": False, "error": f"no existe: {path}"})
+            return
+        ctype = CONTENT_TYPES.get(os.path.splitext(full)[1], "application/octet-stream")
+        with open(full, "rb") as f:
+            data = f.read()
+        conn.sendall(
+            f"HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\n"
+            f"Content-Length: {len(data)}\r\nCache-Control: no-store\r\n"
+            "Connection: close\r\n\r\n".encode() + data)
+    except Exception as e:
+        try:
+            http_json(conn, "500 Internal Server Error", {"ok": False, "error": str(e)})
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+def serve_http(server):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", HTTP_PORT))
+    sock.listen(16)
+    while True:
+        try:
+            conn, _ = sock.accept()
+            threading.Thread(target=handle_http, args=(server, conn), daemon=True).start()
+        except Exception as e:
+            print(f"[http] error: {e}", file=sys.stderr)
+
+
 def main():
     server = WsServer()
     t = threading.Thread(target=server.run, daemon=True)
     t.start()
+    threading.Thread(target=serve_http, args=(server,), daemon=True).start()
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("127.0.0.1", TCP_PORT))
     s.listen(8)
-    print(f"[zen-live-bridge] ws=127.0.0.1:{WS_PORT} tcp=127.0.0.1:{TCP_PORT} (150 pergamino)", flush=True)
+    print(f"[zen-live-bridge] ws=127.0.0.1:{WS_PORT} tcp=127.0.0.1:{TCP_PORT} http=127.0.0.1:{HTTP_PORT}", flush=True)
     while True:
         try:
             conn, _ = s.accept()

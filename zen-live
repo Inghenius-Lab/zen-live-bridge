@@ -324,6 +324,20 @@ def main():
                 return
             time.sleep(paso / 1000.0)
 
+    if cmd in ("back", "forward", "reload", "interactive", "annotate-clear"):
+        r = send({"cmd": cmd, "tabId": int(opt("--tab", "0")) or None})
+        if not r.get("ok"):
+            print(json.dumps(r, ensure_ascii=False)); return
+        if cmd == "interactive":
+            print("%d elementos interactivos" % r.get("count", 0))
+            for it in r.get("elements", [])[:25]:
+                print("  %2d %-8s %s" % (it.get("n"), it.get("tag"), it.get("text", "")[:52]))
+        elif cmd == "annotate-clear":
+            print("anotaciones quitadas")
+        else:
+            print("%s ok (tab %s)" % (cmd, r.get("tabId")))
+        return
+
     if cmd == "locate":
         r = send({"cmd": "locate", "sel": opt("--sel", ""), "text": opt("--text", ""),
                   "nth": int(opt("--nth", "")) if opt("--nth", "") else None,
@@ -459,8 +473,12 @@ def main():
         return
 
     if cmd == "shot":
+        # --tab / --annotated son flags; solo el primer posicionable es el
+        # nombre del fichero. Antes "--tab" se colaba como nombre y producia
+        # /tmp/zen-shot/--tab.png.
         name = args[0] if args else "captura"
-        r = send({"cmd": "shot"})
+        r = send({"cmd": "shot", "tabId": int(opt("--tab", "0")) or None,
+                  "annotated": "annotated" in sys.argv or "annotate" in sys.argv})
         if not r.get("ok"):
             print(json.dumps(r, ensure_ascii=False)); return
         out_dir = "/tmp/zen-shot"

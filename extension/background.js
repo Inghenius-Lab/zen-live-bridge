@@ -280,6 +280,24 @@ function fnMaster(cmd, a, b, c) {
       });
       return J({ ok: true, count: items.length, items });
     }
+    case 'interactive': {
+      // Listado puro, sin overlay. Lo usa el panel lateral, que ya muestra los
+      // numeros en su propia lista y no quiere pintar cajas en la pagina real.
+      const old = document.getElementById('__zen_live_overlay');
+      if (old) old.remove();
+      const els = list(a);
+      return J({ ok: true, count: els.length,
+                 elements: els.slice(0, 60).map((e, i) => ({ n: i + 1,
+                   tag: e.tagName.toLowerCase(),
+                   text: (e.getAttribute('aria-label') || label(e)).replace(/\s+/g, ' ').slice(0, 90) })) });
+    }
+
+    case 'annotate-clear': {
+      const old = document.getElementById('__zen_live_overlay');
+      if (old) old.remove();
+      return J({ ok: true, cleared: true });
+    }
+
     case 'click-at': {
       const el = list(null)[Number(a) - 1];
       if (!el) return J({ ok: false, error: 'indice fuera de rango: ' + a });
@@ -465,55 +483,6 @@ function fnClick(sel, txt, nth) {
 
 // Localiza SIN hacer clic. Sirve cuando eval esta bloqueado por CSP: en vez
 // de buscar en el DOM con js, el agente pide coordenadas y hace clic real.
-function fnLocate(sel, txt, nth) {
-  const els = interactiveList(sel);
-  let el = (nth !== undefined && els[nth]) ? els[nth] : els[0];
-  if (!el && txt) {
-    el = [...document.querySelectorAll('a,button,[role=button],summary,label,h1,h2,h3')]
-      .find(e => ((e.innerText || e.textContent || '') + '').trim().includes(txt));
-  }
-  if (!el) return JSON.stringify({ ok: false, error: 'no encontrado para locate' });
-  const { r } = visibleBox(el);
-  return JSON.stringify({ ok: true, tag: el.tagName.toLowerCase(),
-                          x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2),
-                          w: Math.round(r.width), h: Math.round(r.height),
-                          inViewport: r.top >= 0 && r.bottom <= (window.innerHeight || 0),
-                          text: ((el.innerText || el.value || el.textContent || '') + '').trim().slice(0, 70) });
-}
-
-// Dibuja un overlay con numeros sobre cada elemento interactuable. Pensado
-// para vision: el agente ve la captura con numeros y luego hace clic-at N.
-// El overlay es pointer-events:none, asi que no estorba a la pagina.
-function fnAnnotate(clear) {
-  const old = document.getElementById('__zen_live_overlay');
-  if (clear) {
-    if (old) old.remove();
-    return JSON.stringify({ ok: true, cleared: true });
-  }
-  if (old) old.remove();
-  const ov = document.createElement('div');
-  ov.id = '__zen_live_overlay';
-  ov.style.cssText = 'position:absolute;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none';
-  document.body.appendChild(ov);
-  const items = [];
-  const els = interactiveList(null);
-  els.slice(0, 60).forEach((el, i) => {
-    const r = el.getBoundingClientRect();
-    const n = i + 1;
-    const box = document.createElement('div');
-    box.style.cssText = `position:absolute;left:${r.left + window.scrollX}px;top:${r.top + window.scrollY}px;` +
-      `width:${r.width}px;height:${r.height}px;border:2px solid #d00;box-sizing:border-box`;
-    const lab = document.createElement('div');
-    lab.textContent = String(n);
-    lab.style.cssText = `position:absolute;left:${r.left + window.scrollX - 2}px;top:${r.top + window.scrollY - 16}px;` +
-      `background:#d00;color:#fff;font:bold 11px monospace;padding:1px 3px;border-radius:2px`;
-    ov.appendChild(box); ov.appendChild(lab);
-    items.push({ n, tag: el.tagName.toLowerCase(),
-                 text: ((el.innerText || el.value || el.textContent || '') + '').trim().slice(0, 50) });
-  });
-  return JSON.stringify({ ok: true, count: items.length, items });
-}
-
 function fnClickAt(n) {
   const idx = Number(n) - 1;
   const el = interactiveList(null)[idx];
@@ -927,6 +896,8 @@ case "key": {
 
     case "locate":
     case "annotate":
+    case "interactive":
+    case "annotate-clear":
     case "click-at":
     case "console":
     case "set-range":
@@ -939,6 +910,22 @@ case "key": {
          msg.nth !== undefined ? msg.nth : null]);
       if (!out.ok) return out;
       return { ok: true, tabId: tab, ...JSON.parse(out.raw) };
+    }
+
+    case "back":
+    case "forward":
+    case "reload": {
+      // These go through the tabs API, not a content script: no need to inject
+      // anything into the page, and it works even if the page is mid-load.
+      const tab = msg.tabId !== undefined && msg.tabId !== null ? msg.tabId : (await activeTab()).id;
+      try {
+        if (msg.cmd === "reload") await browser.tabs.reload(tab);
+        else if (msg.cmd === "back") await browser.tabs.goBack(tab);
+        else await browser.tabs.goForward(tab);
+        return { ok: true, tabId: tab, cmd: msg.cmd };
+      } catch (e) {
+        return { ok: false, error: String(e) };
+      }
     }
 
     case "click": {

@@ -44,6 +44,55 @@ zen-live activate [TABID]  # marca pestaña activa
 zen-live close TABID       # cierra pestaña creada por el agente
 ```
 
+## Panel lateral
+
+`Ctrl+E` en Zen abre el panel. Es una extension normal con `sidebar_action`, asi
+que aparece en la barra de extensiones con su icono y tambien se puede anclar.
+
+La UI **no va dentro del xpi**: el puente la sirve desde `webui/` en el puerto
+8789 y el panel la mete en un iframe. Eso se puede notar: se edita `webui/*.css`
+en caliente y se recarga, sin reempaquetar nada. La unica excepcion es el token,
+que si viaja en el codigo empaquetado porque una WebExtension no puede leer
+archivos locales.
+
+```
+Ctrl+E
+  panel.html  (moz-extension://, unico sitio con el token)
+    └─ iframe → http://127.0.0.1:8789/ui/
+         └─ fetch /api/*  →  puente  →  WS 8788  →  extension  →  pagina
+```
+
+El token viaja del panel al iframe por `postMessage`, no en la query: una URL con
+el secreto acaba en historiales y logs. La web servida en `/ui/` no lo lleva
+dentro; sin el `postMessage` se queda sin API y lo dice, en vez de pedir datos y
+recibir un 401.
+
+### Comandos que usa
+
+| | |
+|---|---|
+| `interactive` | lista los elementos interactivos **sin** dibujar cajas en la pagina |
+| `annotate` | numerarlos tambien sobre la pagina, para trabajar con una captura |
+| `annotate-clear` | quitar el overlay |
+| `click-at N` | pulsar el numero N |
+| `back` `forward` `reload` | navegacion via la API de pestanas, sin inyectar script |
+
+`interactive` y `annotate` salen del mismo recorrido determinista del DOM, asi que
+el numero N es el mismo elemento en ambos. Si divergieran, un clic desde el panel
+podria dar en otro sitio que el que el agente ve numerado.
+
+### Puertos
+
+| | |
+|---|---|
+| 8788 | WebSocket de la extension (exige token + `Origin: moz-extension://`) |
+| 8789 | HTTP: UI en `/ui/` y API en `/api/*` (esta exige token) |
+| 8790 | CLI, JSON delimitado por saltos de linea (exige token) |
+
+El HTTP va en puerto aparte a proposito: meter HTTP y JSON-linea en el mismo puerto
+obliga a sniffear los primeros bytes y es fragil. `/ui/` se sirve sin token porque
+es maquetacion vacia; lo unico que manda algo al navegador es `/api/`.
+
 ## Seguridad
 
 El puente maneja la sesión ya autenticada del usuario, así que no es un detalle
