@@ -156,3 +156,35 @@ no relanza.
 
 ## Licencia
 MIT
+
+## Historial y deshacer
+
+Un agente con tu sesion real es una caja negra si no deja rastro. Cada accion
+que pasa por el panel se guarda en memoria (ultimas 200) y aparece en la
+seccion **Acciones**, con la hora y la pestaña.
+
+Lo que **se puede** deshacer desde ahi:
+
+| Accion | Como se revierte |
+|---|---|
+| `goto` / `back` / `forward` | historial del navegador |
+| `scroll` | scroll en sentido contrario |
+| `fill` / `shadowfill` / `set-range` | se guarda el valor previo del DOM antes de actuar |
+| `annotate` / `annotate-clear` | la contraparte |
+
+Lo que **no**: `click`, enviar, borrar. Se registran igual pero sin boton de
+deshacer, porque no existe vuelta atras. Es preferible que el panel lo diga
+a que prometa un undo que miente.
+
+```bash
+curl -H "X-Zen-Live-Token: $(cat ~/.local/state/zen-live-bridge/token)" \
+     'http://127.0.0.1:8789/api/history?limit=20'
+
+curl -X POST -H "X-Zen-Live-Token: $(cat ~/.local/state/zen-live-bridge/token)" \
+     -H 'Content-Type: application/json' -d '{"id":3}' \
+     http://127.0.0.1:8789/api/undo
+```
+
+El historial vive **en memoria del proceso**: al reiniciar el puente se
+pierde. Es deliberado, no se escribe nada a disco.
+

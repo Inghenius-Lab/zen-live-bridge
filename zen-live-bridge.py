@@ -103,6 +103,7 @@ class WsServer:
     def __init__(self):
         self.token = load_or_make_token()
         self.lock = threading.Lock()
+        self.history = []           # historial de acciones para deshacer
         self.client = None          # conexion WS activa de la extension
         self.pending = {}           # id -> threading.Event + resultado
         self.seq = 0
@@ -224,6 +225,84 @@ class WsServer:
                 ws.send_text(json.dumps({"id": 0, "cmd": "ping"}))
             except Exception:
                 return
+    # --- historial de acciones -------------------------------------------
+    # Un agente con tu sesion real es una caja negra si no dejas rastro. Cada
+    # comando que pasa por la UI se guarda aqui con su inversa posible, para
+    # que el panel pueda listarlo y deshacerlo. Solo se guardan los que pasan
+    # por /api/cmd (la UI); el CLI deja su propio rastro en la terminal.
+    HISTORY_MAX = 200
+
+    # Solo tiene sentido deshacer lo que se puede deshacer de verdad. Un click
+    # en "archivar" no se puede revertir desde aqui, asi que se registra pero se
+    # marca sin inversa en vez de fingir que se puede.
+    UNDOABLE = {"goto": "back", "back": "forward", "forward": "back", "reload": "reload",
+                "scroll": "scroll-invert", "set-range": "set-range-prev",
+                "fill": "fill-prev", "shadowfill": "fill-prev", "select": "select-prev",
+                "annotate": "annotate-clear", "annotate-clear": "annotate"}
+
+    def record(self, req):
+        entry = {"id": len(self.history), "ts": time.time(), "cmd": req.get("cmd", "?"),
+                 "tab": req.get("tabId"), "arg": req.get("sel") or req.get("text") or req.get("n"),
+                 "ok": None, "undo": self.UNDOABLE.get(req.get("cmd", "")),
+                 "label": self._label(req)}
+        # Para los que necesitan el valor previo, se toma del DOM antes de actuar.
+        if req.get("cmd") in ("fill", "shadowfill", "set-range", "select"):
+            try:
+                prev = self.send_command({"cmd": "inputvalue", "tabId": req.get("tabId"),
+                                          "sel": req.get("sel") or req.get("text"), "timeout": 10})
+                entry["prev"] = prev.get("value") if isinstance(prev, dict) else None
+            except Exception:
+                entry["prev"] = None
+        self.history.append(entry)
+        if len(self.history) > self.HISTORY_MAX:
+            del self.history[:len(self.history) - self.HISTORY_MAX]
+        return entry
+
+    @staticmethod
+    def _label(req):
+        c, a = req.get("cmd", "?"), req.get("sel") or req.get("text") or req.get("n")
+        if c in ("goto",): return a or ""
+        if c == "click-at": return "elemento #%s" % a
+        if c == "scroll": return str(a or "abajo")
+        if c == "annotate": return "numerar elementos"
+        if c == "annotate-clear": return "quitar numeros"
+        if c == "reload": return "recargar"
+        if c in ("back", "forward"): return c
+        if a is None: return c          # sin argumento no inventar un "None"
+        return ("%s %s" % (c, a)).strip()
+
+    def undo(self, entry_id):
+        """Revierte una entrada del historial. Devuelve el resultado del comando
+        inverso, o explica por que no se pudo."""
+        entry = next((e for e in self.history if e["id"] == entry_id), None)
+        if entry is None:
+            return {"ok": False, "error": f"no existe la accion {entry_id}"}
+        how = entry.get("undo")
+        if not how:
+            return {"ok": False, "error": f"'{entry['cmd']}' no se puede deshacer",
+                    "hint": "las acciones irreversibles (click, enviar, borrar) no tienen vuelta atras"}
+        t = entry.get("tab")
+        if how == "back":      cmd = {"cmd": "back", "tabId": t}
+        elif how == "forward": cmd = {"cmd": "forward", "tabId": t}
+        elif how == "reload":  cmd = {"cmd": "reload", "tabId": t}
+        elif how == "scroll-invert":
+            d = entry.get("arg") or "down"
+            op = {"up": "down", "down": "up", "top": "bottom", "bottom": "top"}.get(str(d).lower(), "up")
+            cmd = {"cmd": "scroll", "tabId": t, "sel": op}
+        elif how == "annotate-clear": cmd = {"cmd": "annotate-clear", "tabId": t}
+        elif how == "annotate":       cmd = {"cmd": "annotate", "tabId": t}
+        elif how in ("fill-prev", "select-prev"):
+            if entry.get("prev") is None:
+                return {"ok": False, "error": "no se guardo el valor anterior, no se puede restaurar"}
+            cmd = {"cmd": "fill", "tabId": t, "sel": entry.get("arg"), "text": entry["prev"]}
+        else:
+            cmd = {"cmd": how, "tabId": t}
+        cmd["timeout"] = 20
+        res = self.send_command(cmd, timeout=20)
+        entry["undone"] = True
+        return {"ok": bool(res.get("ok")) if isinstance(res, dict) else True,
+                "deshecho": entry["label"] or entry["cmd"], "result": res}
+
     def send_command(self, command, timeout=120):
         with self.lock:
             if not self.client:
@@ -330,6 +409,7 @@ def read_http(conn, limit=1 << 20):
     lines = head.decode("latin1").split("\r\n")
     parts = (lines[0].split(" ") + ["", "", ""])[:3]
     method, path = parts[0], parts[1]
+    path = path.partition("?")[0]
     headers = {}
     for line in lines[1:]:
         if ":" in line:
@@ -337,18 +417,26 @@ def read_http(conn, limit=1 << 20):
             headers[k.strip().lower()] = v.strip()
     n = int(headers.get("content-length", "0") or 0)
     body = rest
+    # parts[1] arrastra el query ("/api/history?limit=50"), y sin separarlo las
+    # comparaciones exactas de ruta no matchean nunca.
+    path, _, qs = path.partition("?")
+    query = {}
+    for pair in qs.split("&"):
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            query[k] = [v]
     while len(body) < n:
         chunk = conn.recv(65536)
         if not chunk:
             break
         body += chunk
-    return method, path, headers, body
+    return method, path, headers, body, query
 
 
 def handle_http(server, conn):
     conn.settimeout(30)
     try:
-        method, path, headers, body = read_http(conn)
+        method, path, headers, body, query = read_http(conn)
         if method is None:
             return
 
@@ -382,6 +470,21 @@ def handle_http(server, conn):
                 })
                 return
 
+            if path == "/api/history" and method == "GET":
+                n = int((query.get("limit") or ["50"])[0])
+                http_json(conn, "200 OK", {"ok": True, "history": server.history[-n:]})
+                return
+
+            if path == "/api/undo" and method == "POST":
+                try:
+                    req = json.loads(body or b"{}")
+                except Exception as e:
+                    http_json(conn, "400 Bad Request", {"ok": False, "error": f"json: {e}"})
+                    return
+                res = server.undo(int(req.get("id", -1)))
+                http_json(conn, "200 OK", res)
+                return
+
             if path == "/api/cmd" and method == "POST":
                 try:
                     req = json.loads(body or b"{}")
@@ -389,7 +492,9 @@ def handle_http(server, conn):
                     http_json(conn, "400 Bad Request", {"ok": False, "error": f"json: {e}"})
                     return
                 t = req.get("timeout", 30)
+                entry = server.record(req)
                 result = server.send_command({**req, "timeout": t}, timeout=t)
+                entry["ok"] = bool(result.get("ok")) if isinstance(result, dict) else True
                 http_json(conn, "200 OK", result if isinstance(result, dict) else {"ok": True})
                 return
 

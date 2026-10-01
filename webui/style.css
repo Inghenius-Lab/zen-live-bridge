@@ -53,3 +53,19 @@ h2 { margin: 0 0 7px; font-size: 11px; letter-spacing: .07em; text-transform: up
 #log div { background: #232830; border: 1px solid var(--line); border-left: 2px solid var(--accent); padding: 4px 8px; border-radius: 5px; font: 11px var(--mono); animation: in .18s; }
 #log div.err { border-left-color: var(--bad); color: var(--bad); }
 @keyframes in { from { opacity: 0; transform: translateY(5px); } }
+
+/* Historial de acciones. Cada fila lleva si es reversible: las irreversibles
+   (un click que archiva, envia o borra) se muestran igual, pero sin boton, en
+   vez de prometer un undo que no existe. */
+.history { display: flex; flex-direction: column; gap: 4px; max-height: 240px; overflow-y: auto; }
+.hrow { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px;
+        background: #1a1f28; border-left: 2px solid #3a4250; font-size: 12px; }
+.hrow.bad { border-left-color: #d05a5a; opacity: .65; }
+.hrow.undone { opacity: .45; text-decoration: line-through; }
+.hrow .hcmd { font-family: ui-monospace, monospace; color: #6ee7b7; flex: 0 0 auto; }
+.hrow .hlabel { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hrow .htag { flex: 0 0 auto; font-size: 10px; opacity: .55; }
+.hrow button { flex: 0 0 auto; }
+.mini { padding: 1px 7px; font-size: 11px; background: #242a34; border: 1px solid #3a4250;
+       border-radius: 5px; color: #cfd6e4; cursor: pointer; }
+.mini:hover { background: #2f3644; }
