@@ -77,6 +77,90 @@ function fnSnap(limit) {
   })).filter(x => x.text || x.tag === 'input' || x.tag === 'textarea');
   return JSON.stringify({ text, els });
 }
+/* ===== v0.6.0: capacidades que faltaban =====
+   key     : teclas reales (Enter, Escape, flechas, Ctrl+...) via CDP-free
+             dispatch a la pagina + browser.tabs API para atajos globales
+   hover   : menús que solo abren al pasar el cursor
+   wait    : esperar a que un selector o texto aparezca (SPAs lentas)
+   links   : extraer todos los href de la pagina (investigacion/scraping)
+   select  : elegir opcion de un <select>
+   tabId   : todos los comandos pasan a aceptar la pestaña objetivo        */
+
+function fnKey(keyName, mods, sel, value) {
+  const parts = String(keyName).split('+');
+  const k = parts[parts.length - 1];
+  const m = { ctrl: mods.includes('ctrl'), alt: mods.includes('alt'),
+              shift: mods.includes('shift'), meta: mods.includes('meta') };
+  let el = sel ? document.querySelector(sel) : null;
+  if (!el) {
+    const ae = document.activeElement;
+    el = (ae && ae !== document.body && ae.tagName !== 'BODY') ? ae : null;
+  }
+  if (el && typeof el.focus === 'function') { try { el.focus(); } catch (e) {} }
+  const target = el || document.body;
+  const init = { key: k, code: 'Key' + k.toUpperCase(), bubbles: true, cancelable: true,
+                 ctrlKey: m.ctrl, altKey: m.alt, shiftKey: m.shift, metaKey: m.meta };
+  try { target.dispatchEvent(new KeyboardEvent('keydown', init)); } catch (e) {}
+  try { target.dispatchEvent(new KeyboardEvent('keypress', init)); } catch (e) {}
+  // Enter en un input debe disparar el submit del formulario
+  if (k === 'Enter' && el && el.form && typeof el.form.requestSubmit === 'function') {
+    try { el.form.requestSubmit(); } catch (e) {}
+  }
+  try { target.dispatchEvent(new KeyboardEvent('keyup', init)); } catch (e) {}
+  return JSON.stringify({ ok: true, key: k, mods: m, onTag: el ? el.tagName.toLowerCase() : 'body' });
+}
+
+function fnHover(sel, nth) {
+  let els = [...document.querySelectorAll(sel || '*')].filter(e => e.offsetWidth || e.offsetHeight);
+  const el = (nth !== undefined && els[nth]) ? els[nth] : (els[0] || null);
+  if (!el) return JSON.stringify({ ok: false, error: 'no encontrado para hover: ' + sel });
+  const r = el.getBoundingClientRect();
+  const x = r.left + r.width / 2, y = r.top + r.height / 2;
+  const o = { bubbles: true, cancelable: true, view: window,
+              clientX: x, clientY: y, pointerType: 'mouse' };
+  try { el.dispatchEvent(new PointerEvent('pointerover', o)); } catch (e) {}
+  try { el.dispatchEvent(new MouseEvent('mouseover', o)); } catch (e) {}
+  try { el.dispatchEvent(new PointerEvent('pointermove', o)); } catch (e) {}
+  try { el.dispatchEvent(new MouseEvent('mousemove', o)); } catch (e) {}
+  return JSON.stringify({ ok: true, tag: el.tagName.toLowerCase(), x: Math.round(x), y: Math.round(y) });
+}
+
+function fnLinks(filter) {
+  const out = [];
+  for (const a of document.querySelectorAll('a[href]')) {
+    const href = a.href;
+    if (!href || href.startsWith('javascript:')) continue;
+    if (filter && href.indexOf(filter) === -1) continue;
+    const txt = ((a.innerText || a.textContent || '') + '').trim().replace(/\s+/g, ' ');
+    out.push({ href, text: txt.slice(0, 120) });
+  }
+  const seen = new Set(); const uniq = [];
+  for (const l of out) { if (!seen.has(l.href)) { seen.add(l.href); uniq.push(l); } }
+  return JSON.stringify({ ok: true, count: uniq.length, links: uniq.slice(0, 500) });
+}
+
+function fnExists(sel, text) {
+  if (sel) {
+    const el = document.querySelector(sel);
+    return JSON.stringify({ ok: true, found: !!el, tag: el ? el.tagName.toLowerCase() : null });
+  }
+  const t = (document.body ? document.body.innerText : '') + '';
+  return JSON.stringify({ ok: true, found: t.toLowerCase().indexOf(String(text).toLowerCase()) !== -1 });
+}
+
+function fnSelect(sel, values) {
+  const el = document.querySelector(sel);
+  if (!el) return JSON.stringify({ ok: false, error: 'select no encontrado: ' + sel });
+  const vals = Array.isArray(values) ? values : [values];
+  const done = [];
+  for (const v of vals) {
+    const opt = [...el.options].find(o => o.value === v || (o.textContent || '').trim() === v);
+    if (opt) { opt.selected = true; done.push(v); }
+  }
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  return JSON.stringify({ ok: true, applied: done, total: el.options.length });
+}
 function fnScroll(px, dir, sel) {
   const before = window.scrollY;
   const d = dir === 'up' ? -1 : 1;
@@ -414,7 +498,7 @@ async function handle(msg) {
 
     case "text":
     case "snap": {
-      const tab = await activeTab();
+      const tab = msg.tabId ? (await browser.tabs.get(msg.tabId)) : (await activeTab());
       if (!tab) return { ok: false, error: "sin pestanyas abiertas" };
       const out = await execFn(tab.id, fnSnap, [20000]);
       if (!out.ok) return out;
@@ -422,6 +506,44 @@ async function handle(msg) {
       return { ok: true, tabId: tab.id, title: tab.title, url: tab.url, ...parsed };
     }
 
+
+case "key": {
+      const tab = msg.tabId || (await activeTab()).id;
+      const keyName = String(msg.key || "").split(/[,+\s]+/).filter(Boolean);
+      const mods = keyName.slice(0, -1).map(s => s.toLowerCase());
+      const k = keyName[keyName.length - 1];
+      const out = await execFn(tab, fnKey, [k, mods, msg.sel || "", msg.value || ""]);
+      if (!out.ok) return out;
+      return { ok: true, tabId: tab, ...JSON.parse(out.raw) };
+    }
+
+    case "hover": {
+      const tab = msg.tabId || (await activeTab()).id;
+      const out = await execFn(tab, fnHover, [msg.sel || "", msg.nth]);
+      if (!out.ok) return out;
+      return { ok: true, tabId: tab, ...JSON.parse(out.raw) };
+    }
+
+    case "links": {
+      const tab = msg.tabId || (await activeTab()).id;
+      const out = await execFn(tab, fnLinks, [msg.filter || ""]);
+      if (!out.ok) return out;
+      return { ok: true, tabId: tab, ...JSON.parse(out.raw) };
+    }
+
+    case "exists": {
+      const tab = msg.tabId || (await activeTab()).id;
+      const out = await execFn(tab, fnExists, [msg.sel || "", msg.text || ""]);
+      if (!out.ok) return out;
+      return { ok: true, tabId: tab, ...JSON.parse(out.raw) };
+    }
+
+    case "select": {
+      const tab = msg.tabId || (await activeTab()).id;
+      const out = await execFn(tab, fnSelect, [msg.sel || "", msg.values || []]);
+      if (!out.ok) return out;
+      return { ok: true, tabId: tab, ...JSON.parse(out.raw) };
+    }
 
     case "scroll": {
       const tab = msg.tabId || (await activeTab()).id;

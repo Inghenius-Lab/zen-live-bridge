@@ -92,6 +92,14 @@ def status():
               f"o instalala en about:addons ({ping.get('error','')})")
 
 
+def opt(flag, default=""):
+    """Valor de un flag estilo --flag val, o default si no esta."""
+    a = sys.argv
+    if flag in a and a.index(flag) + 1 < len(a):
+        return a[a.index(flag) + 1]
+    return default
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -162,7 +170,7 @@ def main():
         limit = 60000
         if "--limit" in sys.argv:
             limit = int(sys.argv[sys.argv.index("--limit") + 1])
-        r = send({"cmd": "text", "limit": limit})
+        r = send({"cmd": "text", "limit": limit, "tabId": int(opt("--tab", "0")) or None})
         if r.get("ok"):
             print(r.get("text", ""))
         else:
@@ -241,13 +249,74 @@ def main():
         print(json.dumps(r, ensure_ascii=False, indent=2))
         return
 
+    if cmd == "key":
+        r = send({"cmd": "key", "key": sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("-") else "Enter",
+                  "sel": opt("--sel", ""), "tabId": int(opt("--tab", "0")) or None})
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return
+
+    if cmd == "hover":
+        r = send({"cmd": "hover", "sel": opt("--sel", ""),
+                  "nth": int(opt("--nth", "")) if opt("--nth", "") else None,
+                  "tabId": int(opt("--tab", "0")) or None})
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return
+
+    if cmd == "links":
+        r = send({"cmd": "links", "filter": opt("--filter", ""),
+                  "tabId": int(opt("--tab", "0")) or None})
+        lim = int(opt("--limit", "40"))
+        if r.get("ok"):
+            print(f"{r.get('count', 0)} links (mostrando {min(lim, r.get('count', 0))})")
+            for l in r.get("links", [])[:lim]:
+                print(f"  {l.get('text','')[:70]} -> {l.get('href','')}")
+            if r.get("count", 0) > lim:
+                print(f"  ... {r.get('count', 0) - lim} mas (--limit / --filter)")
+        else:
+            print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "select":
+        vals = opt("--values", "")
+        r = send({"cmd": "select", "sel": opt("--sel", ""),
+                  "values": [v for v in vals.split(",") if v],
+                  "tabId": int(opt("--tab", "0")) or None})
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return
+
+    if cmd == "wait":
+        # La espera vive en el cliente: el service worker de la extension se
+        # duerme solo, asi que un setTimeout ahi no es fiable. El sondeo usa
+        # el comando exists y no js, porque js exige --allow-eval y falla
+        # bajo CSP (X, Gmail y varias SPA).
+        sel, txt = opt("--sel", ""), opt("--text", "")
+        timeout = int(opt("--timeout", "15000"))
+        paso = int(opt("--step", "400"))
+        tabid = int(opt("--tab", "0")) or None
+        if not sel and not txt:
+            print(json.dumps({"ok": False, "error": "usa --sel o --text"}, ensure_ascii=False))
+            return
+        limite = time.time() + timeout / 1000.0
+        while True:
+            probe = send({"cmd": "exists", "sel": sel, "text": txt, "tabId": tabid})
+            if probe.get("found"):
+                print(json.dumps({"ok": True, "found": True, "tag": probe.get("tag"),
+                                  "esperado": sel or txt}, ensure_ascii=False))
+                return
+            if time.time() >= limite:
+                print(json.dumps({"ok": False, "error": "timeout %dms esperando %s"
+                                  % (timeout, sel or txt)}, ensure_ascii=False))
+                return
+            time.sleep(paso / 1000.0)
+
     if cmd == "scroll":
         a = sys.argv
         px = int(a[a.index("--px") + 1]) if "--px" in a else 1200
         direction = a[a.index("--dir") + 1] if "--dir" in a else "down"
         sel = a[a.index("--sel") + 1] if "--sel" in a else ""
         wait = int(a[a.index("--wait") + 1]) if "--wait" in a else 900
-        r = send({"cmd": "scroll", "px": px, "dir": direction, "sel": sel})
+        r = send({"cmd": "scroll", "px": px, "dir": direction, "sel": sel,
+                  "tabId": int(opt("--tab", "0")) or None})
         # scripting.executeScript no espera promesas ni renders de SPA:
         # el scroll es instantaneo, el render sigue en la pagina.
         import time as _t

@@ -23,6 +23,13 @@ zen-live tabs              # lista pestañas reales
 zen-live goto URL [--new]  # abre pestaña en background (no roba foco)
 zen-live text | snap       # lee texto / interactivos con selectores
 zen-live scroll [PX] [--dir up|down] [--sel CSS] [--wait MS]  # scroll; reporta delta
+zen-live key Enter|Ctrl+A [--sel CSS]    # teclas reales (+ requestSubmit en forms)
+zen-live hover --sel CSS [--nth N]      # menus que solo abren al pasar el cursor
+zen-live links [--filter DOMINIO]       # extrae hrefs (scraping/investigacion)
+zen-live wait --sel CSS | --text T      # espera a que aparezca (SPAs lentas)
+zen-live select --sel CSS --values a,b  # <select> nativo (casi nadie lo usa ya)
+zen-live exists --sel CSS               # booleano sin eval, funciona bajo CSP
+# casi todos aceptan --tab N para no depender de la pestanya activa
 zen-live click --sel CSS   # clic real
 zen-live fill --sel CSS --value V [--submit]
 zen-live js 'expr'         # evalúa JS en la pestaña activa
