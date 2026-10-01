@@ -99,7 +99,19 @@ if [[ "${1:-}" == "--restart-zen" ]]; then
   # backend no existe y todo lo que la WebExtension no puede hacer (alert/
   # confirm, subir ficheros, instalar extensions) se queda sin cobertura.
   # Solo escucha en loopback, como el resto.
-  setsid -f "$(command -v zen-browser)" --marionette >/dev/null 2>&1 || true
-  sleep 20
+  # nohup + log: con "setsid -f >/dev/null" el proceso se lanzaba pero murio
+  # dos veces seguidas al perder el controlling terminal. Con nohup y un log
+  # propio aguanta. El log confirma que Marionette levanto ("Listening on port 2828").
+  nohup setsid "$(command -v zen-browser)" --marionette \
+    >/tmp/zen-launch.log 2>&1 </dev/null &
+  disown 2>/dev/null || true
+  # esperar a que los 4 puertos esten, en vez de dormir a ciegas
+  for _ in $(seq 1 15); do
+    n=$(ss -tln 2>/dev/null | grep -cE ':(2828|8788|8789|8790)\b')
+    [ "$n" -ge 4 ] && break
+    sleep 2
+  done
+  grep -q "Listening on port 2828" /tmp/zen-launch.log 2>/dev/null \
+    || echo "AVISO: Marionette no arranco; revisa /tmp/zen-launch.log" >&2
   zen-live status 2>&1 | tail -2
 fi
