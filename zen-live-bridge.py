@@ -18,6 +18,216 @@ TOKEN_FILE = os.path.expanduser(
     os.environ.get("ZEN_LIVE_TOKEN_FILE", "~/.local/state/zen-live-bridge/token"))
 
 
+# ===== v0.11 SAFETY GUARDS =====
+# Guard 6: AUDIT LOG. El extension no puede escribir ficheros (WebExtension no
+# tiene API de disco), asi que el log va aqui, en el puente: es el unico punto
+# por el que pasan TODOS los comandos, tanto del CLI (TCP 8790) como del panel
+# web (HTTP 8789). Complementario del historial del panel, no sustituto.
+STATE_DIR = os.path.dirname(TOKEN_FILE)
+AUDIT_FILE = os.path.join(STATE_DIR, "audit.jsonl")
+AUDIT_MAX_BYTES = 5 * 1024 * 1024
+
+# Clasificacion de comandos. WRITE son los que MUTAN la pagina o el navegador;
+# READ son los que solo observan. El read-only mode (guard 3) se apoya en esto.
+READ_CMDS = {
+    "ping", "tabs", "text", "snap", "snapRefs", "links", "locate", "annotate",
+    "interactive", "annotate-clear", "exists", "wait", "console", "history",
+    "css", "network", "screenshot", "shot", "cookies", "cookiesFor",
+    "listContainers", "list-containers", "doctor", "snapshot",
+}
+# localstorage/sessionstorage dependen de la accion: list/get leen, set/delete/clear escriben.
+STORAGE_WRITE_ACTIONS = {"set", "delete", "clear"}
+
+def is_write_command(req):
+    """True si el comando MUTA la pagina o el navegador."""
+    cmd = str(req.get("cmd", "") or "")
+    if cmd in ("localstorage", "sessionstorage"):
+        return str(req.get("action", "list") or "list").lower() in STORAGE_WRITE_ACTIONS
+    if cmd == "storage-clear":
+        return True
+    return cmd not in READ_CMDS
+
+def audit_target(req):
+    """Descripcion del objetivo del comando SIN el valor sensible.
+
+    Lo unico que se guarda del fill es el selector y la longitud del texto
+    escrito, nunca el texto: un audit log con el valor dentro es un segundo
+    sitio donde acaba la contrasena que el usuario escribio.
+    """
+    cmd = str(req.get("cmd", "") or "")
+    out = {}
+    if req.get("url"):
+        u = str(req["url"])
+        # Solo esquema+host+path: la query string lleva tokens de sesion.
+        try:
+            from urllib.parse import urlsplit
+            sp = urlsplit(u)
+            out["url"] = "%s://%s%s" % (sp.scheme, sp.netloc, sp.path)
+        except Exception:
+            out["url"] = u[:120]
+    if req.get("sel"):
+        out["sel"] = str(req["sel"])[:120]
+    if req.get("ref"):
+        out["ref"] = str(req["ref"])[:16]
+    if req.get("key"):
+        out["key"] = str(req["key"])[:40]
+    if req.get("text"):
+        out["text"] = str(req["text"])[:40]
+    if req.get("n") is not None:
+        out["n"] = req["n"]
+    if "value" in req:
+        # Solo la longitud. El contenido jamas.
+        out["value_len"] = len(str(req.get("value") or ""))
+    if "expr" in req:
+        out["expr_len"] = len(str(req.get("expr") or ""))
+    if req.get("tabId") is not None:
+        out["tabId"] = req["tabId"]
+    if req.get("action"):
+        out["action"] = str(req["action"])[:20]
+    return out
+
+# Guard 3: READ-ONLY MODE. Flag apagado por defecto: cambiar el comportamiento
+# por defecto de una herramienta que ya usa el usuario seria una decision suya,
+# no nuestra. Se activa con `zen-live readonly on`.
+READONLY_DEFAULT = os.environ.get("ZEN_LIVE_READONLY", "0") == "1"
+
+# Guard 4: RATE LIMIT. 120 escrituras/min es alto para un humano y bajo para un
+# bucle runaway que esta clicando miles de veces. Configurable con
+# ZEN_LIVE_RATE_LIMIT (0 = sin limite).
+RATE_LIMIT_DEFAULT = int(os.environ.get("ZEN_LIVE_RATE_LIMIT", "120"))
+RATE_WINDOW = 60.0
+
+# Guard 5: SITIOS PROTEGIDOS. Patron de URL (bancos, pago, salud, gobierno).
+# No es un muro: es un freno que obliga a repetir el comando con confirm_token,
+# de modo que la intencion tiene que ser explicita y queda en el audit log.
+PROTECTED_PATTERNS = [
+    ("banco", r"(paypal|stripe|payoneer|mercadopago|mercadolibre|checkout\.|/payment|/pago|/transfer|wire-?transfer)"),
+    ("banco", r"(bbva|santander|banorte|hsbc|barclays|chase\.com|bankofamerica|wellsfargo|citi\.com|/banco|/banking|/netbanking|/online-?banking)"),
+    ("salud", r"(salud|health|mychart|patientportal|/patients?|hospital|clinic|medic(?:a|al)|/historia-clinica)"),
+    ("gobierno", r"(\.gob(\.|$)|\.gob\.ve|\.gob\.mx|\.gob\.es|sede\.electronic|agencia\b.*\btribut|hacienda|sat\.gob|agencia-?tributaria|registro-?civil)"),
+    ("infraestructura", r"(github\.com/.*/(settings|admin)|gitlab\.com/.*/(settings|admin)|cloudflare\.com|console\.aws|docker\.hub)"),
+]
+PROTECTED_COMPILED = [(label, __import__("re").compile(p, __import__("re").I)) for label, p in PROTECTED_PATTERNS]
+
+def protected_match(url):
+    if not url:
+        return None
+    u = str(url)
+    for label, rx in PROTECTED_COMPILED:
+        if rx.search(u):
+            return label
+    return None
+
+class Guards:
+    """Estado de los guards que necesitan memoria (read-only, rate, tokens)."""
+    def __init__(self):
+        self.readonly = READONLY_DEFAULT
+        self.rate_limit = RATE_LIMIT_DEFAULT
+        self.write_times = []          # marcas de tiempo de escrituras (rate limit)
+        self.confirmed = {}            # token -> (cmd, url, expira)
+
+    def snapshot(self):
+        return {"readonly": self.readonly, "rate_limit": self.rate_limit,
+                "writes_last_min": len([t for t in self.write_times if time.time() - t < RATE_WINDOW]),
+                "audit_file": AUDIT_FILE}
+
+    def check(self, req):
+        """Devuelve None si pasa, o dict de denegacion."""
+        cmd = str(req.get("cmd", "?") or "?")
+        # ping/doctor/listContainers/audit/guards son de administracion: nunca se
+        # bloquean a si mismos, o no habria forma de desactivar el read-only.
+        if cmd in ("ping", "doctor", "shutdown", "guards", "audit", "listContainers", "list-containers"):
+            return None
+        write = is_write_command(req)
+        now = time.time()
+        if self.readonly and write:
+            return {"guard": "read-only",
+                    "error": "read-only: %s es una escritura y el modo lectura esta activo "
+                             "(desactivalo con: zen-live readonly off)" % cmd}
+        if write and self.rate_limit > 0:
+            self.write_times = [t for t in self.write_times if now - t < RATE_WINDOW]
+            if len(self.write_times) >= self.rate_limit:
+                return {"guard": "rate-limit",
+                        "error": "rate limit: %d escrituras en los ultimos 60s (maximo %d). "
+                                 "Espera o subelo con: zen-live ratelimit N"
+                                 % (len(self.write_times), self.rate_limit)}
+        # Guard 5: solo para escrituras (leer una pagina de un banco no es arriesgado).
+        if write and req.get("url"):
+            label = protected_match(req.get("url"))
+            if label:
+                tok = req.get("confirm_token")
+                key = (cmd, str(req.get("url")))
+                if tok:
+                    exp = self.confirmed.get(str(tok))
+                    if exp and exp["key"] == key and exp["exp"] > now:
+                        return None
+                    if exp and exp["exp"] <= now:
+                        self.confirmed.pop(str(tok), None)
+                import hashlib as _h
+                new_tok = _h.sha256(("%s|%s|%s" % (cmd, req.get("url"), self._salt())).encode()).hexdigest()[:16]
+                self.confirmed[new_tok] = {"key": key, "exp": now + 300}
+                return {"guard": "protected-site",
+                        "confirm_token": new_tok,
+                        "error": "requiere confirmacion: sitio protegido (%s). "
+                                 "Repite el comando con confirm_token=%s si de verdad quieres seguir. "
+                                 "El token vale 5 minutos y solo para este comando y esta URL." % (label, new_tok)}
+        if write:
+            self.write_times.append(time.time())
+        return None
+
+    @staticmethod
+    def _salt():
+        # El token depende del token del puente: reiniciar el puente invalida
+        # los confirm_tokens ya emitidos, que es justo lo que se quiere.
+        try:
+            with open(TOKEN_FILE) as f:
+                return f.read().strip()
+        except OSError:
+            return "salt"
+
+def audit(req, decision, guard=None, reason=None, tab_id=None):
+    """Escribe una linea JSON. NUNCA lanza: auditar no puede romper el puente."""
+    try:
+        entry = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "decision": decision,
+            "guard": guard,
+            "cmd": str(req.get("cmd", "?") or "?"),
+            "target": audit_target(req),
+        }
+        if reason:
+            entry["reason"] = str(reason)[:200]
+        if tab_id is not None:
+            entry["tabId"] = tab_id
+        d = os.path.dirname(AUDIT_FILE)
+        if d:
+            os.makedirs(d, mode=0o700, exist_ok=True)
+        # Rotacion por tamano: un log que crece sin limite llena el disco.
+        try:
+            if os.path.exists(AUDIT_FILE) and os.path.getsize(AUDIT_FILE) > AUDIT_MAX_BYTES:
+                os.replace(AUDIT_FILE, AUDIT_FILE + ".1")
+        except OSError:
+            pass
+        fd = os.open(AUDIT_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+def audit_tail(n=40):
+    try:
+        with open(AUDIT_FILE) as f:
+            lines = f.readlines()
+        out = []
+        for ln in lines[-int(n):]:
+            try:
+                out.append(json.loads(ln))
+            except Exception:
+                continue
+        return out
+    except FileNotFoundError:
+        return []
+
 def load_or_make_token():
     """Token compartido entre puente, CLI y extension.
 
@@ -102,6 +312,7 @@ class WsClient:
 class WsServer:
     def __init__(self):
         self.token = load_or_make_token()
+        self.guards = Guards()          # guards 3/4/5: read-only, rate, protegidos
         self.lock = threading.Lock()
         self.history = []           # historial de acciones para deshacer
         self.client = None          # conexion WS activa de la extension
@@ -304,6 +515,24 @@ class WsServer:
                 "deshecho": entry["label"] or entry["cmd"], "result": res}
 
     def send_command(self, command, timeout=120):
+        # Guards 3/4/5 + audit (6). send_command es el unico camino que usan
+        # tanto el CLI (TCP 8790) como el panel web (HTTP 8789), asi que un
+        # solo punto de control basta para los dos y no se puede saltar por el
+        # otro camino. Los guards 1 y 2 viven en la extension (ahi esta el DOM).
+        cmd = str(command.get("cmd", "?") or "?")
+        if cmd == "guards":
+            return {"ok": True, **self.guards.snapshot()}
+        if cmd == "audit":
+            return {"ok": True, "file": AUDIT_FILE, "entries": audit_tail(command.get("limit", 40))}
+        denial = self.guards.check(command)
+        if denial:
+            audit(command, "denegado", denial.get("guard"), denial.get("error"))
+            return {"ok": False, **denial}
+        # NO se audita aqui como "permitido": el comando todavia no se ha
+        # ejecutado. Los guards 1 y 2 viven en la extension y pueden denegarlo
+        # despues; el log se escribe una sola vez, con la decision final (mas
+        # abajo, cuando llega la respuesta). Asi no sale "permitido" seguido de
+        # "denegado" para la misma orden, que parece una fuga del guard.
         with self.lock:
             if not self.client:
                 return {"ok": False, "error": "sin extension conectada: carga Zen Live Bridge en about:debugging o instalala"}
@@ -318,8 +547,18 @@ class WsServer:
                 return {"ok": False, "error": f"ws send: {e}"}
         if not ev["event"].wait(timeout):
             self.pending.pop(cmd_id, None)
+            audit(command, "denegado", "timeout", f"timeout ({timeout}s)")
             return {"ok": False, "error": f"timeout ({timeout}s): la extension no respondio"}
-        return ev["result"]
+        res = ev["result"]
+        # Decision final: si la extension denies (guard 1 o 2) se deniega; si no,
+        # permitted. Una sola linea por orden, con lo que de verdad paso.
+        if isinstance(res, dict) and not res.get("ok") and res.get("guard"):
+            audit(command, "denegado", res.get("guard"), res.get("error"))
+        else:
+            ok = res.get("ok") if isinstance(res, dict) else True
+            audit(command, "permitido" if ok else "denegado", None,
+                  None if ok else (res.get("error") if isinstance(res, dict) else None))
+        return res
 
 def handle_tcp_conn(server, conn):
     conn.settimeout(600)
@@ -468,6 +707,44 @@ def handle_http(server, conn):
                     "version": r.get("version", ""),
                     "http_port": HTTP_PORT,
                 })
+                return
+
+            if path == "/api/guards" and method == "POST":
+                # Unico sitio donde se cambia el estado de los guards. Va por
+                # HTTP (con token) y no como comando mas de la extension: si
+                # fuera un cmd normal, en read-only no habria forma de apagarlo.
+                try:
+                    req = json.loads(body or b"{}")
+                except Exception as e:
+                    http_json(conn, "400 Bad Request", {"ok": False, "error": f"json: {e}"})
+                    return
+                op = req.get("op")
+                val = req.get("value")
+                if op == "readonly":
+                    if val is None or str(val).lower() == "status":
+                        pass
+                    elif str(val).lower() in ("on", "1", "true", "yes"):
+                        server.guards.readonly = True
+                    elif str(val).lower() in ("off", "0", "false", "no"):
+                        server.guards.readonly = False
+                    else:
+                        http_json(conn, "400 Bad Request", {"ok": False, "error": "valor: on|off|status"})
+                        return
+                    audit({"cmd": "guards:readonly", "value": val}, "permitido", "control",
+                          "read-only -> %s" % server.guards.readonly)
+                elif op == "ratelimit":
+                    if val not in (None, "", "status"):
+                        try:
+                            server.guards.rate_limit = int(val)
+                        except ValueError:
+                            http_json(conn, "400 Bad Request", {"ok": False, "error": "ratelimit debe ser un numero"})
+                            return
+                        audit({"cmd": "guards:ratelimit", "value": val}, "permitido", "control",
+                              "rate limit -> %d" % server.guards.rate_limit)
+                else:
+                    http_json(conn, "400 Bad Request", {"ok": False, "error": "op: readonly|ratelimit"})
+                    return
+                http_json(conn, "200 OK", {"ok": True, **server.guards.snapshot()})
                 return
 
             if path == "/api/history" and method == "GET":

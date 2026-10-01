@@ -65,6 +65,57 @@ async function activeTab() {
   return (anyTab && anyTab.length) ? anyTab[anyTab.length - 1] : null;
 }
 
+/* ===== v0.11 SAFETY GUARDS =====
+   Guard 1: ESQUEMA DE URL. Sin esto, `goto` es un puente a todo lo que el
+   navegador puede abrir y el agente no deberia: file: lee el disco local,
+   javascript: ejecuta codigo con los privilegios de la pagina, data: inyecta
+   HTML arbitrario, moz-extension:/chrome:/resource: expone paginas internas.
+   Se aplica con lista blanca (http, https) y no con lista negra: asi un
+   esquema inventado manana tampoco pasa.
+   about:blank si se permite: es la pagina vacia, no expone nada; el resto de
+   about: son paginas internas del navegador (about:preferences, about:addons)
+   y quedan fuera. */
+const URL_SCHEMES_OK = new Set(["http", "https"]);
+const URL_SCHEMES_WHY = {
+  "file": "leeria ficheros del disco local",
+  "javascript": "ejecutaria codigo con los privilegios de la pagina",
+  "data": "inyectaria HTML/CSS/JS arbitrario en una pestana",
+  "blob": "contenido opaco generado en memoria",
+  "moz-extension": "leeria paginas internas de extensiones",
+  "chrome": "leeria paginas internas del navegador",
+  "resource": "leeria recursos internos del navegador",
+  "view-source": "leeria el codigo fuente de otra pagina",
+  "jar": "leeria ficheros JAR del sistema",
+  "ftp": "protocolo obsoleto, no red moderna",
+};
+function guardUrl(raw) {
+  const s = String(raw == null ? "" : raw).trim();
+  if (!s) return { ok: false, guard: "url-scheme", error: "guard: URL vacia" };
+  const m = /^([a-z][a-z0-9+.-]*):/i.exec(s);
+  if (!m) {
+    return { ok: false, guard: "url-scheme",
+             error: "guard: sin esquema; solo se admiten http:// y https:// (ej: https://ejemplo.com)" };
+  }
+  const scheme = m[1].toLowerCase();
+  if (scheme === "about") {
+    if (/^about:blank(#[^\s]*)?$/i.test(s)) return { ok: true, guard: "url-scheme", scheme: "about:blank" };
+    return { ok: false, guard: "url-scheme",
+             error: "guard: esquema about: bloqueado (paginas internas del navegador; solo se permite about:blank)" };
+  }
+  if (URL_SCHEMES_OK.has(scheme)) return { ok: true, guard: "url-scheme", scheme: scheme + ":" };
+  const why = URL_SCHEMES_WHY[scheme] || "no es un esquema de red permitido";
+  return { ok: false, guard: "url-scheme", denied_scheme: scheme + ":",
+           error: "guard: esquema " + scheme + ": bloqueado (" + why + "). Solo se permite http:// y https://" };
+}
+
+/* Guard 2: CAMPO DE CONTRASENA. fnFill/fnFillRef reciben el elemento real, asi
+   que basta mirar el tipo y el autocomplete: NO se lee el valor jamas, solo se
+   rechaza. Motivo: no existe API WebExtension para leer contrasenas, y no hace
+   falta — el punto es que el agente no escriba ahi. Si el campo es de
+   contrasena, la escritura la hace el gestor de contrasenas del navegador, que
+   ademas sabe mas (dominios, 2FA) que un agente con la sesion del usuario.
+   Ojo: esto no es un muro. Un campo con type=text en un formulario raro puede
+   ser una contrasena disfrazada; el guard cubre los casos declarados. */
 // ===== Funciones inyectables SIN eval (MV3-safe) =====
 function fnText(limit) {
   return (document.body && document.body.innerText) ? document.body.innerText.slice(0, limit || 60000) : "";
@@ -661,6 +712,19 @@ function fnFill(sel, value, submitEnter, nth) {
   let el = (nth !== undefined && els[nth]) ? els[nth] : (els[0] || null);
   if (!el && sel) el = document.querySelector(sel);
   if (!el) return JSON.stringify({ ok: false, error: "campo no encontrado: " + sel });
+  // Guard 2 (autocompleto a proposito: executeScript serializa SOLO esta
+  // funcion, asi que isPasswordField de arriba no existiria aqui dentro).
+  // No se lee el valor: solo type/autocomplete, y se rechaza.
+  const __tag = el && el.tagName ? el.tagName.toLowerCase() : "";
+  let __pwd = false;
+  if (__tag === "input" || __tag === "textarea") {
+    if (String(el.type || "").toLowerCase() === "password") __pwd = true;
+    else { let __ac = ""; try { __ac = String(el.getAttribute("autocomplete") || "").toLowerCase(); } catch (e) {}
+           __pwd = /(^|\s)(current-password|new-password)(\s|$)/.test(__ac); }
+  }
+  if (__pwd)
+    return JSON.stringify({ ok: false, guard: "password-field",
+      error: "escrito rechazado: campo de contrasena (usa el gestor de contrasenas del navegador)" });
   if (el.isContentEditable) {
     el.focus();
     el.textContent = value;
@@ -721,6 +785,19 @@ function fnShadowFill(sel, value, submitEnter) {
     el = deepQueryAll(parts[0])[0] || null;
   }
   if (!el) return JSON.stringify({ ok: false, error: "campo no encontrado en shadow: " + sel });
+  // Guard 2 (autocompleto a proposito: executeScript serializa SOLO esta
+  // funcion, asi que isPasswordField de arriba no existiria aqui dentro).
+  // No se lee el valor: solo type/autocomplete, y se rechaza.
+  const __tag = el && el.tagName ? el.tagName.toLowerCase() : "";
+  let __pwd = false;
+  if (__tag === "input" || __tag === "textarea") {
+    if (String(el.type || "").toLowerCase() === "password") __pwd = true;
+    else { let __ac = ""; try { __ac = String(el.getAttribute("autocomplete") || "").toLowerCase(); } catch (e) {}
+           __pwd = /(^|\s)(current-password|new-password)(\s|$)/.test(__ac); }
+  }
+  if (__pwd)
+    return JSON.stringify({ ok: false, guard: "password-field",
+      error: "escrito rechazado: campo de contrasena (usa el gestor de contrasenas del navegador)" });
   try { el.focus(); } catch (e) {}
   el.scrollIntoView({ block: 'center' });
   setNativeValue(el, value);
@@ -814,6 +891,19 @@ function fnClickRef(ref) {
 function fnFillRef(ref, value, submitEnter) {
   const el = document.querySelector('[data-agent-ref="' + ref + '"]');
   if (!el) return JSON.stringify({ ok: false, error: 'ref no encontrado: ' + ref });
+  // Guard 2 (autocompleto a proposito: executeScript serializa SOLO esta
+  // funcion, asi que isPasswordField de arriba no existiria aqui dentro).
+  // No se lee el valor: solo type/autocomplete, y se rechaza.
+  const __tag = el && el.tagName ? el.tagName.toLowerCase() : "";
+  let __pwd = false;
+  if (__tag === "input" || __tag === "textarea") {
+    if (String(el.type || "").toLowerCase() === "password") __pwd = true;
+    else { let __ac = ""; try { __ac = String(el.getAttribute("autocomplete") || "").toLowerCase(); } catch (e) {}
+           __pwd = /(^|\s)(current-password|new-password)(\s|$)/.test(__ac); }
+  }
+  if (__pwd)
+    return JSON.stringify({ ok: false, guard: "password-field",
+      error: "escrito rechazado: campo de contrasena (usa el gestor de contrasenas del navegador)" });
   el.scrollIntoView({ block: 'center', behavior: 'instant' });
   el.focus();
   if (el.isContentEditable) {
@@ -931,6 +1021,8 @@ async function handle(msg) {
     }
 
     case "goto": {
+      const g = guardUrl(msg.url);
+      if (!g.ok) return { ok: false, guard: g.guard, error: g.error, denied: g.denied_scheme || null };
       const newTab = msg.new !== false;
       let tab;
       if (newTab) {
@@ -1101,18 +1193,20 @@ case "key": {
     }
 
     case "click": {
-      const tab = await activeTab();
+      const tab = msg.tabId ? (await browser.tabs.get(msg.tabId)) : (await activeTab());
       if (!tab) return { ok: false, error: "sin pestanyas abiertas" };
       const out = await execFn(tab.id, fnClick, [msg.sel || "", msg.text || ""]);
+      if (!out.ok) return out;
       const parsed = JSON.parse(out.raw);
       if (parsed.ok && msg.wait) await sleep(Number(msg.wait));
       return { ok: parsed.ok, tabId: tab.id, ...parsed };
     }
 
     case "fill": {
-      const tab = await activeTab();
+      const tab = msg.tabId ? (await browser.tabs.get(msg.tabId)) : (await activeTab());
       if (!tab) return { ok: false, error: "sin pestanyas abiertas" };
       const out = await execFn(tab.id, fnFill, [msg.sel, msg.value || "", !!msg.submit, (msg.nth === undefined ? 0 : msg.nth)]);
+      if (!out.ok) return out;
       const parsed = JSON.parse(out.raw);
       if (parsed.ok && msg.wait) await sleep(Number(msg.wait));
       return { ok: parsed.ok, tabId: tab.id, ...parsed };
@@ -1166,6 +1260,8 @@ case "key": {
       if (!browser.contextualIdentities || !browser.contextualIdentities.query) {
         return { ok: false, error: "contextualIdentities no disponible. Añade el permiso al manifest." };
       }
+      const g = guardUrl(msg.url);
+      if (!g.ok) return { ok: false, guard: g.guard, error: g.error, denied: g.denied_scheme || null };
       const url = msg.url; const contName = msg.container || "";
       const ids = await browser.contextualIdentities.query({ name: contName });
       if (!ids || !ids[0]) return { ok: false, error: "contenedor no encontrado: " + contName };
@@ -1206,7 +1302,7 @@ case "key": {
     }
 
     case "snapRefs": {
-      const tab = await activeTab();
+      const tab = msg.tabId ? (await browser.tabs.get(msg.tabId)) : (await activeTab());
       if (!tab) return { ok: false, error: "sin pestaña activa" };
       const out = await execFn(tab.id, fnSnapRefs, []);
       if (!out.ok) return out;
@@ -1214,7 +1310,7 @@ case "key": {
     }
 
     case "clickRef": {
-      const tab = await activeTab();
+      const tab = msg.tabId ? (await browser.tabs.get(msg.tabId)) : (await activeTab());
       if (!tab) return { ok: false, error: "sin pestaña activa" };
       const out = await execFn(tab.id, fnClickRef, [msg.ref || ""]);
       if (!out.ok) return out;
@@ -1222,7 +1318,7 @@ case "key": {
     }
 
     case "fillRef": {
-      const tab = await activeTab();
+      const tab = msg.tabId ? (await browser.tabs.get(msg.tabId)) : (await activeTab());
       if (!tab) return { ok: false, error: "sin pestaña activa" };
       const out = await execFn(tab.id, fnFillRef, [msg.ref || "", msg.value || "", !!msg.submit]);
       if (!out.ok) return out;

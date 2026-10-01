@@ -21,6 +21,10 @@ Uso:
 
 Requiere: la extension "Zen Live Bridge" cargada en Zen (about:debugging o
 instalada). Sin extension, ping falla con mensaje claro.
+  guards                            # estado de los safety guards (v0.11)
+  readonly on|off                   # modo lectura: bloquea escrituras (v0.11)
+  ratelimit N                       # max escrituras/min, 0 = sin limite (v0.11)
+  audit [--limit N]                 # ultimas decisiones (permitido/denegado) (v0.11)
   localstorage <list|get|set|delete|clear> [clave] [valor]
   sessionstorage <list|get|set|delete|clear> [clave] [valor]
   storage-clear                        limpia localStorage y sessionStorage
@@ -45,12 +49,18 @@ def load_token():
         return ""
 
 
+HTTP_PORT = int(os.environ.get("ZEN_LIVE_HTTP", "8789"))
 TCP_PORT = int(os.environ.get("ZEN_LIVE_TCP", "8790"))  # 8787 = stt-server (canonico ecosistema)
 WS_PORT = int(os.environ.get("ZEN_LIVE_WS", "8788"))
 BRIDGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zen-live-bridge.py")
 
 
 def send(cmd, timeout=120):
+    # Guard 5: si el agente repite el comando con el confirm_token que le dio el
+    # puente, se lo pasamos. Se anade aqui y no en cada rama para que funcione
+    # con los 48 comandos sin tocar cada uno.
+    if "--confirm-token" in sys.argv:
+        cmd = dict(cmd, confirm_token=sys.argv[sys.argv.index("--confirm-token") + 1])
     try:
         s = socket.create_connection(("127.0.0.1", TCP_PORT), timeout=5)
     except OSError as e:
@@ -73,6 +83,24 @@ def send(cmd, timeout=120):
     except Exception:
         return {"ok": False, "error": f"respuesta invalida: {buf[:200]!r}"}
 
+
+def _http_control(payload):
+    """Cambia el estado de los guards por la API HTTP del puente.
+
+    El flag de read-only lo tiene que cambiar ALGUIEN con el token, y el CLI de
+    TCP solo puede mandar ordenes a la extension: si `readonly off` fuera un
+    comando mas de los 48, el propio guard lo dejaria bloqueado para siempre.
+    """
+    try:
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", HTTP_PORT, timeout=8)
+        body = json.dumps(payload)
+        conn.request("POST", "/api/guards", body,
+                     {"Content-Type": "application/json", "x-zen-live-token": load_token()})
+        r = conn.getresponse()
+        return json.loads(r.read().decode())
+    except Exception as e:
+        return {"ok": False, "error": "control HTTP: %s" % e}
 
 def ensure_server():
     if server_up():
@@ -216,7 +244,8 @@ def main():
         if "--wait" in sys.argv: wait = int(sys.argv[sys.argv.index("--wait") + 1])
         if not sel and not text:
             print("necesitas --sel CSS o --text TEXTO"); sys.exit(1)
-        r = send({"cmd": "click", "sel": sel, "text": text, "wait": wait})
+        r = send({"cmd": "click", "sel": sel, "text": text, "wait": wait,
+                  "tabId": int(opt("--tab", "0")) or None})
         print(json.dumps(r, ensure_ascii=False))
         return
 
@@ -228,7 +257,8 @@ def main():
         submit = "--submit" in sys.argv
         wait = int(sys.argv[sys.argv.index("--wait") + 1]) if "--wait" in sys.argv else None
         nth = int(sys.argv[sys.argv.index("--nth") + 1]) if "--nth" in sys.argv else None
-        r = send({"cmd": "fill", "sel": sel, "value": value, "submit": submit, "wait": wait, "nth": nth})
+        r = send({"cmd": "fill", "sel": sel, "value": value, "submit": submit, "wait": wait, "nth": nth,
+                  "tabId": int(opt("--tab", "0")) or None})
         print(json.dumps(r, ensure_ascii=False))
         return
 
@@ -516,7 +546,10 @@ def main():
         return
 
     if cmd == "snap-refs":
-        r = send({"cmd": "snapRefs"})
+        # Sin tabId, el snapshot se hacia sobre la pestana ACTIVA y los refs
+        # appartenencias a esa: luego fill-ref --tab N decia "ref no encontrado"
+        # porque el ref se creo en otra pestana.
+        r = send({"cmd": "snapRefs", "tabId": int(opt("--tab", "0")) or None})
         if r.get("ok") and "els" in r:
             limit = 90
             if "--limit" in sys.argv:
@@ -539,7 +572,7 @@ def main():
 
     if cmd == "click-ref":
         ref = args[0] if args else input("ref (ej: e3): ")
-        r = send({"cmd": "clickRef", "ref": ref})
+        r = send({"cmd": "clickRef", "ref": ref, "tabId": int(opt("--tab", "0")) or None})
         print(json.dumps(r, ensure_ascii=False))
         return
 
@@ -547,9 +580,23 @@ def main():
         if not args:
             print("uso: zen-live fill-ref <ref> <valor> [--submit]"); sys.exit(1)
         ref = args[0]
-        value = " ".join(a for a in args[1:] if not a.startswith("--"))
+        # El valor es lo que queda tras el ref, saltando los flags Y su valor.
+        # Antes solo se filtraban los flags, asi que "--tab 71" metia "71" dentro
+        # del texto escrito en la pagina.
+        rest = args[1:]
+        skip = set()
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a.startswith("--"):
+                skip.add(a)
+                if a in ("--tab", "--wait", "--nth", "--container", "--cookie-store") and i + 1 < len(rest):
+                    skip.add(rest[i + 1]); i += 1
+            i += 1
+        value = " ".join(a for a in rest if a not in skip)
         submit = "--submit" in sys.argv
-        r = send({"cmd": "fillRef", "ref": ref, "value": value, "submit": submit})
+        r = send({"cmd": "fillRef", "ref": ref, "value": value, "submit": submit,
+                  "tabId": int(opt("--tab", "0")) or None})
         print(json.dumps(r, ensure_ascii=False))
         return
 
@@ -594,6 +641,31 @@ def main():
             print("zen-live close TABID — usa 'zen-live tabs' para ver ids"); return
         r = send({"cmd": "close", "tabId": int(args[0])})
         print(json.dumps(r, ensure_ascii=False))
+        return
+
+    # --- v0.11: administracion de los safety guards ---
+    if cmd == "guards":
+        print(json.dumps(send({"cmd": "guards"}), ensure_ascii=False, indent=2))
+        return
+
+    if cmd == "readonly":
+        r = _http_control({"op": "readonly", "value": args[0] if args else "status"})
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return
+
+    if cmd == "ratelimit":
+        r = _http_control({"op": "ratelimit", "value": args[0] if args else ""})
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return
+
+    if cmd == "audit":
+        r = send({"cmd": "audit", "limit": int(opt("--limit", "40"))})
+        if not r.get("ok"):
+            print(json.dumps(r, ensure_ascii=False)); return
+        print("# " + r["file"])
+        for e in r["entries"]:
+            tgt = " ".join("%s=%s" % (k, v) for k, v in e.get("target", {}).items())
+            print("%s %-9s %-15s %-14s %s" % (e["ts"], e["decision"], e.get("guard") or "-", e["cmd"], tgt))
         return
 
     print(__doc__)

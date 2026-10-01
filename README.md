@@ -258,6 +258,131 @@ llamada relee el correo, asi que no hay estado entre invocaciones.
 CODE=$(./otp morales) && zen-live fill '#code' "$CODE" --tab N
 ```
 
+
+## v0.11 — Safety Guards
+
+Un agente con tu sesion real puede escribir en paginas, pulsar botones y
+navegar. Estos guards acotan eso. **Los guards 1 y 2 estan siempre activos**;
+los 3, 4 y 5 se configuran y el 6 se escribe solo.
+
+```bash
+zen-live guards                     # estado actual de los guards
+zen-live readonly on|off            # modo lectura (off por defecto)
+zen-live ratelimit N                # maximo de escrituras por minuto (120)
+zen-live audit [--limit N]          # ultimas decisiones
+zen-live goto URL --confirm-token T # repetir un comando en sitio protegido
+```
+
+### 1. Esquema de URL (`url-scheme`) — siempre activo
+
+`goto` (y `openInContainer`) solo aceptan `http:` y `https:`, mas `about:blank`.
+Todo lo demas se rechaza **antes** de abrir la pestana.
+
+Es una **lista blanca**, no negra: `file:`, `javascript:`, `data:`, `blob:`,
+`moz-extension:`, `chrome:`, `resource:`, `view-source:`, `jar:`, `ftp:` y el
+resto de `about:` quedan fuera. Una lista negra dejaria pasar cualquier esquema
+que se invente mañana.
+
+```bash
+zen-live goto 'file:///etc/passwd'
+# {"ok":false,"guard":"url-scheme","error":"guard: esquema file: bloqueado (leeria ficheros del disco local). Solo se permite http:// y https://","denied":"file:"}
+```
+
+### 2. Campo de contrasena (`password-field`) — siempre activo
+
+`fill`, `fill-ref` y `shadowfill` se niegan a escribir si el elemento es
+`input[type=password]` o tiene `autocomplete` `current-password` / `new-password`.
+
+**No se lee el valor: solo se rechaza.** No hace falta leer contrasenas para no
+escribirlas, y no existe API WebExtension para leerlas.
+
+```bash
+zen-live fill --sel '#p' --value 'hunter2'
+# {"ok":false,"guard":"password-field","error":"escrito rechazado: campo de contrasena (usa el gestor de contrasenas del navegador)"}
+```
+
+Limite honesto: un `input[type=text]` que en realidad sea una contrasena
+disfrazada pasa el guard. Cubre los casos declarados, no es un muro.
+
+### 3. Modo lectura (`read-only`) — apagado por defecto
+
+Con `zen-live readonly on` se bloquean las escrituras (`click`, `fill`, `key`,
+`goto`, `scroll`, `select`, `set-range`, `localstorage set/delete/clear`...) y
+pasan las lecturas (`text`, `snap`, `interactive`, `annotate`, `screenshot`,
+`css`, `network`, `localstorage list`, `tabs`, `cookies`, `history`...).
+
+Apagado por defecto a proposito: cambiar el comportamiento por defecto de una
+herramienta que ya usas es decision tuya, no nuestra.
+
+`localstorage`/`sessionstorage` se clasifican por accion: `list` y `get` leen,
+`set`/`delete`/`clear` escriben.
+
+Se apaga con `zen-live readonly off` por HTTP con token, **no** como un comando
+mas: si fuera un comando normal, en read-only no habria forma de desactivarlo.
+
+### 4. Limite de ritmo (`rate-limit`)
+
+Maximo de escrituras por minuto (120 por defecto; `0` = sin limite). Corta un
+bucle runaway que este clicando miles de veces. Las lecturas no cuentan.
+
+```bash
+zen-live ratelimit 4    # y a la 5a escritura: {"guard":"rate-limit","error":"rate limit: 4 escrituras en los ultimos 60s (maximo 4)..."}
+```
+
+### 5. Sitios protegidos (`protected-site`)
+
+Patron de URL de bancos, pago, salud, gobierno y admins de infraestructura.
+Una **escritura** a una URL que encaja devuelve `confirm_token`; si repites el
+mismo comando con ese token, pasa.
+
+```bash
+zen-live goto 'https://www.bbva.com/netbanking'
+# {"ok":false,"guard":"protected-site","confirm_token":"44492c1c5c125e5c","error":"requiere confirmacion: sitio protegido (banco)..."}
+zen-live goto 'https://www.bbva.com/netbanking' --confirm-token 44492c1c5c125e5c   # ok
+```
+
+El token dura 5 minutos, vale **solo** para ese comando y esa URL, y se invalida
+al reiniciar el puente (depende del token del puente). Leer una pagina de un
+banco no requiere confirmacion: el riesgo es escribir, no mirar.
+
+Honestidad: esto es un **freno**, no una autenticacion. Un agente que repita el
+comando pasa. Su valor es que la intencion tiene que ser explicita y queda
+registrada en el audit log.
+
+### 6. Audit log — siempre activo
+
+Una linea JSON por orden en `~/.local/state/zen-live-bridge/audit.jsonl`
+(`0600`, rota a 5 MB):
+
+```json
+{"ts":"2026-10-01T14:28:07","decision":"denegado","guard":"password-field","cmd":"fill","target":{"sel":"#p","value_len":18,"tabId":77}}
+```
+
+**Redaccion:** del texto escrito solo se guarda `value_len`, nunca el contenido.
+De la URL solo esquema+host+path, porque la query string lleva tokens de sesion.
+Los codigos 2FA tampoco se guardan. Un audit log con el valor dentro seria un
+segundo sitio donde acaba la contrasena.
+
+Va en el puente (`zen-live-bridge.py`), no en la extension: **una WebExtension
+no puede escribir ficheros**, y el puente es el punto unico por el que pasan
+tanto el CLI (TCP 8790) como el panel web (HTTP 8789). Complementario del
+historial del panel, no sustituto.
+
+Una sola linea por orden, con la decision **final**: si la extension deniega
+(guards 1 y 2), se registra `denegado`, no un `permitido` seguido de `denegado`.
+
+### Donde vive cada guard
+
+| Guard | Donde | Por que ahi |
+|---|---|---|
+| 1 esquema | `extension/background.js` | es lo unico que ve la URL antes de `tabs.create` |
+| 2 contrasena | `extension/background.js` | hace falta el elemento real del DOM |
+| 3 read-only | `zen-live-bridge.py` | estado en memoria; la extension se reinicia sola (MV3) |
+| 4 rate limit | `zen-live-bridge.py` | idem: un contador en el SW se perderia al dormir |
+| 5 protegidos | `zen-live-bridge.py` | tokens compartidos y comparables |
+| 6 audit | `zen-live-bridge.py` | la extension no tiene API de disco |
+
+
 ### Por que NO es lo mismo que KeePassXC
 
 KeePassXC genera los TOTP **dentro del navegador** y el codigo nunca pasa por
@@ -281,9 +406,37 @@ tu codigo"). El extractor mira una ventana a ambos lados.
 
 ### Que NO cubre
 
-- CAPTCHA de reCAPTCHA / Cloudflare / hCaptcha: son antibot por diseno. Para
-  imagen/texto, `tesseract` ya esta instalado y se puede usar con un recorte.
-  reCAPTCHA lo resuelve Buster (extension, Firefox incluido) por audio.
+### CAPTCHA y desafios — FUERA DE ALCANCE por decision de seguridad
+
+**Zen Live no resuelve CAPTCHAs ni sortea desafios, y no se va a anadir.** No es
+una limitacion tecnica pendiente: es una decision. Un agente con tu sesion ya
+puede hacer mucho; resolverle el antibot de un tercero automaticamente anade
+una capacidad de evadir un control que otro sistema puso a proposito. Si la
+pagina te pide un desafio, el flujo correcto es que lo resuelvas tu.
+
+Lo que YA hay en la maquina, y por que no se expose como comando:
+
+- `tesseract 5.5.3` (`/usr/bin/tesseract`, eng/spa/afr/osd) resuelve CAPTCHA de
+  **texto/imagen** por OCR. Un comando `ocr` que lo aplique sobre un recorte de
+  la pagina SI seria portable y no necesitaria CDP. No implementado aqui a
+  proposito: seria automatizar el evasion, no leer texto.
+- `ocrmypdf` es para PDFs escaneados, no para captchas.
+- `oathtool`, `otpauth`, `ddddocr`, `opencv`, `angr`: **no instalados**.
+
+Lo mejor de GitHub hoy, y por que no se integra:
+
+| Proyecto | Estrellas | Nota |
+|---|---|---|
+| [NopeCHALLC/nopecha](https://github.com/NopeCHALLC/nopecha-extension) | 11.004 | La mas completa (reCAPTCHA, hCaptcha, Turnstile, Arkose, Geetest, DataDome...). Es **libreria**, y requiere Chromium/CDP. **No portable a Zen**: Firefox cerro CDP con WONTFIX (bugzilla 1679876) y Zen es Gecko. |
+| [dessant/buster](https://github.com/dessant/buster) | 9.316 | Extension **para humanos**. Resuelve reCAPTCHA por **audio** (speech recognition), no por OCR. Declara soporte Firefox explicitamente: la unica con ese soporte. |
+| [TheGP/untidetect-tools](https://github.com/TheGP/untidetect-tools) | 2.018 | Herramientas de fingerprint/anti-detect. |
+| henryzawadzki6542/cloudflare-turnstile-bypass | 624 | Scripts de pago, no es open source de verdad. |
+
+Conclusion honesta: la mejor libreria (nopecha) no sirve para Zen por CDP, y la
+unica con soporte Firefox (buster) esta pensada para que la resuelva una
+persona. Integrar cualquiera de las dos en un agente seria el caso de uso que
+este parrafo quiere evitar.
 - Contrasenas. No hay ninguna API WebExtension para leerlas, y no se anade una:
-  las credenciales van en el gestor del navegador.
+  las credenciales van en el gestor del navegador. El guard 2 de v0.11 refuerza
+  esto: el agente tampoco puede **escribir** en un campo de contrasena.
 
