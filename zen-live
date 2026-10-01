@@ -247,7 +247,13 @@ def main():
         direction = a[a.index("--dir") + 1] if "--dir" in a else "down"
         sel = a[a.index("--sel") + 1] if "--sel" in a else ""
         wait = int(a[a.index("--wait") + 1]) if "--wait" in a else 900
-        r = send({"cmd": "scroll", "px": px, "dir": direction, "sel": sel, "wait": wait})
+        r = send({"cmd": "scroll", "px": px, "dir": direction, "sel": sel})
+        # scripting.executeScript no espera promesas ni renders de SPA:
+        # el scroll es instantaneo, el render sigue en la pagina.
+        import time as _t
+        _t.sleep(wait / 1000.0)
+        if r.get("ok"):
+            r["waitedMs"] = wait
         print(json.dumps(r, ensure_ascii=False))
         return
 

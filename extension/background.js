@@ -77,22 +77,23 @@ function fnSnap(limit) {
   })).filter(x => x.text || x.tag === 'input' || x.tag === 'textarea');
   return JSON.stringify({ text, els });
 }
-function fnScroll(px, dir, sel, waitMs) {
+function fnScroll(px, dir, sel) {
   const before = window.scrollY;
+  const d = dir === 'up' ? -1 : 1;
   if (sel) {
     const el = document.querySelector(sel);
-    if (el) { el.scrollIntoView({ block: dir === 'up' ? 'start' : 'end', behavior: 'smooth' }); }
+    if (el) { el.scrollIntoView({ block: dir === 'up' ? 'start' : 'end' }); }
   } else {
-    window.scrollBy({ top: (dir === 'up' ? -1 : 1) * Math.abs(px), behavior: 'smooth' });
+    window.scrollBy(0, d * Math.abs(px));
   }
-  // SPA: X/LinkedIn cargan por scroll, hay que dar tiempo al render
-  return new Promise(resolve => setTimeout(() => {
-    resolve(JSON.stringify({
-      ok: true, before, after: window.scrollY,
-      delta: window.scrollY - before,
-      height: document.body.scrollHeight
-    }));
-  }, waitMs));
+  // scrollBy con comportamiento instantaneo: despues el render de la SPA
+  // sigue, asi que el llamador debe dormir --wait antes de leer texto.
+  return JSON.stringify({
+    ok: true, before, after: window.scrollY,
+    delta: window.scrollY - before,
+    height: document.body ? document.body.scrollHeight : 0,
+    matched: sel ? !!document.querySelector(sel) : null
+  });
 }
 function fnClick(sel, txt) {
   let el = null;
@@ -374,7 +375,8 @@ function fillCode(sel, value, submit) {
 async function handle(msg) {
   switch (msg.cmd) {
     case "ping":
-      return { ok: true, pong: true, name: "zen-live-bridge", version: "0.2.2" };
+      let _v = "?"; try { _v = browser.runtime.getManifest().version; } catch (e) {}
+      return { ok: true, pong: true, name: "zen-live-bridge", version: _v };
 
     case "tabs": {
       const tabs = await browser.tabs.query({});
@@ -423,7 +425,7 @@ async function handle(msg) {
 
     case "scroll": {
       const tab = msg.tabId || (await activeTab()).id;
-      const out = await execFn(tab, fnScroll, [msg.px || 1200, msg.dir || "down", msg.sel || "", msg.wait || 900]);
+      const out = await execFn(tab, fnScroll, [msg.px || 1200, msg.dir || "down", msg.sel || ""]);
       if (!out.ok) return out;
       return { ok: true, tabId: tab, ...JSON.parse(out.raw) };
     }
