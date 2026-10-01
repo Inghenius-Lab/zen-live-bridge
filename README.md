@@ -218,3 +218,27 @@ saber si limpio algo.
 `browser.windows`), no por inyeccion: uno lee estilos calculados y el otro
 cambia el estado de la ventana.
 
+## Historial del navegador (v0.11)
+
+```bash
+zen-live history                          # 20 mas recientes
+zen-live history github --limit 5         # filtrar por texto
+zen-live history "open code" --limit 3    # el filtro acepta varias palabras
+```
+
+Usa `browser.history.search` (permiso `history`), no el DOM: funciona en
+cualquier pestana sin navegar a ella. Devuelve titulo, URL y ultima visita.
+
+**Que aporta frente a otras piezas del sistema.** `recall` ya leia el
+historial, asi que esto no es lo mismo:
+
+| Herramienta | Guarda | Pregunta que responde |
+|---|---|---|
+| `recall` | `places.sqlite` + shell (atuin) | *¿que he estado buscando?* |
+| `zen-live history` | historial de Zen, con filtro | *¿que paginas concrete conozco?* |
+| `/api/history` | acciones del agente | *¿que he **hecho** en el navegador?* |
+
+Las tres encadenan: `recall "tema"` -> `zen-live history TEMA` -> `goto URL`
+para volver a una pagina sin buscarla de nuevo. `history` es el puente entre
+"me acuerdo de que estuve ahi" y "vuelve alla".
+

@@ -391,6 +391,30 @@ def main():
         return
 
     # --- v0.10: almacenamiento, red, css, ventana ---
+    if cmd == "history":
+        # El filtro son los args que NO son flags ni su valor. Sin esto,
+        # "history --limit 5" mandaba "--limit" como texto a buscar y
+        # history.search devolvia 0 resultados.
+        flags = {"--limit", "--tab"}
+        pos = []
+        i = 0
+        while i < len(args):
+            if args[i] in flags:
+                i += 2; continue
+            pos.append(args[i]); i += 1
+        r = send({"cmd": "history",
+                  "filter": " ".join(pos),
+                  "limit": int(opt("--limit", "20")),
+                  "tabId": int(opt("--tab", "0")) or None})
+        if not r.get("ok"):
+            print(r.get("error", "error")); return
+        print("%d entradas de historial" % r.get("count", 0))
+        for it in r.get("items", []):
+            when = (it.get("lastVisit") or "")[:16].replace("T", " ")
+            print("  %s  %s" % (when, it.get("title") or "(sin titulo)"))
+            print("      %s" % it.get("url", ""))
+        return
+
     if cmd in ("localstorage", "sessionstorage"):
         action = args[0] if args else "list"
         r = send({"cmd": cmd, "action": action,

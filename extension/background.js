@@ -997,6 +997,28 @@ case "key": {
     case "locate":
     case "annotate":
     case "interactive":
+    case "history": {
+      // browser.history.*: no necesita ir a la pagina, asi que va aqui y no en
+      // fnMaster. search() devuelve title/url/lastVisitTime.
+      if (!browser.history || !browser.history.search) {
+        return { ok: false, error: "API history no disponible" };
+      }
+      const q = String(msg.filter || "").trim();
+      const max = Math.min(parseInt(msg.limit, 10) || 20, 200);
+      // history.search exige 'text': un string vacio da
+      // "Type error for parameter query (Property text is required)".
+      // Para listar lo mas reciente sin filtro se usa un espacio, que la API
+      // acepta como comodin, y se recorta el limite con maxResults.
+      const res = await browser.history.search({ text: q || " ", maxResults: max });
+      return {
+        ok: true, count: res.length, filter: q,
+        items: res.map(h => ({
+          title: h.title || "", url: h.url,
+          lastVisit: h.lastVisitTime ? new Date(h.lastVisitTime).toISOString() : ""
+        }))
+      };
+    }
+
     case "localstorage":
     case "sessionstorage":
     case "storage-clear":
