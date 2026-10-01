@@ -102,7 +102,12 @@ if [[ "${1:-}" == "--restart-zen" ]]; then
   # nohup + log: con "setsid -f >/dev/null" el proceso se lanzaba pero murio
   # dos veces seguidas al perder el controlling terminal. Con nohup y un log
   # propio aguanta. El log confirma que Marionette levanto ("Listening on port 2828").
-  nohup setsid "$(command -v zen-browser)" --marionette \
+  # zen-auto, NO zen-browser: el wrapper limpio existe DELIBERADAMENTE sin
+  # estos flags porque navigator.webdriver=true hace que Google bloquee anadir
+  # cuentas nuevas (incidentes 2026-08-29 y 2026-09-20). Usa /usr/bin/zen-browser
+  # para logins, nunca zen-auto. Aqui va el contrario: necesitamos Marionette
+  # para los agentes, y aceptamos webdriver=true a cambio.
+  nohup setsid "$HOME/.local/bin/zen-auto" \
     >/tmp/zen-launch.log 2>&1 </dev/null &
   disown 2>/dev/null || true
   # esperar a que los 4 puertos esten, en vez de dormir a ciegas

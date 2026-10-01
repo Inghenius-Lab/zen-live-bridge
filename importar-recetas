@@ -83,6 +83,24 @@ INJECTION = [
      r"(api[\s_-]?keys?|tokens?|secrets?|secretos?|credentials?|credenciales)",
      "exfiltrate-credentials"),
     (r"(your|the)\s+api[\s_-]?key\s+is", "exfiltrate-credentials"),
+    # 3.a persona y verbo conjugado: "Sends your API key to...", "will send your
+    # credentials...". Antes solo se cubria el imperativo ("send your key"), asi
+    # que la prosa que describe la inyeccion en vez de ordenarla pasaba limpia.
+    (r"\b(sends?|posted?|uploads?|shares?|leaks?|sends?|uploading|sending|"
+     r"sharing|leaking|transmits?|forwards?|exfiltrates?)\s+"
+     r"((me\s+)?(your|the|his|her|their|its)\s+)?"
+     r"(user'?s?|tu|su|sus)?\s*"
+     r"(api[\s_-]?keys?|tokens?|secrets?|secretos?|credentials?|credenciales?|"
+     r"passw(?:or)?ds?|contrase[nñ]as?|session[\s_-]?cookies?|cookies?)\b",
+     "exfiltrate-credentials"),
+    # "password" con verbo de transferencia, que antes no estaba en la lista
+    (r"\b(sends?|uploads?|posts?|shares?|leaks?|exfiltrates?|transmits?)\b"
+     r"[^.\n]{0,40}\bpassw(?:or)?d", "exfiltrate-credentials"),
+    (r"\b(your|the)\s+passw(?:or)?d\s+(is|will be|gets?)\b",
+     "exfiltrate-credentials"),
+    # "sube tu contrasena a", en espanol
+    (r"\b(env[ií]a|sube|subida|env[ií]ale|manda|comparte|filtra)\b"
+     r"[^.\n]{0,40}\bcontrase[nñ]a", "exfiltrate-credentials"),
     (r"api[\s_-]?key\s*[:=]\s*['\"]?[A-Za-z0-9_\-]{16,}", "hardcoded-secret"),
     (r"gh[pousr]_[A-Za-z0-9]{20,}", "hardcoded-secret"),
     (r"sk-[A-Za-z0-9]{20,}", "hardcoded-secret"),
