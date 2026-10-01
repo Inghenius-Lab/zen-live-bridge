@@ -440,3 +440,44 @@ este parrafo quiere evitar.
   las credenciales van en el gestor del navegador. El guard 2 de v0.11 refuerza
   esto: el agente tampoco puede **escribir** en un campo de contrasena.
 
+## Dos backends sobre el mismo navegador
+
+Zen Live (WebExtension) y el MCP `firefox-devtools` (Marionette) controlan la
+**misma sesion de Zen**, con las mismas cookies. No son alternativas: cada uno
+cubre lo que el otro no puede.
+
+| Puerto | Backend | Cubre |
+|---|---|---|
+| `127.0.0.1:8788` | WebExtension (Zen Live) | click, fill, scroll, snap, texto, cookies, red, storage, historial, guards |
+| `127.0.0.1:2828` | **Marionette** | `alert`/`confirm`, subir ficheros, instalar extensions |
+| `127.0.0.1:8789` | servidor web | panel local |
+| `127.0.0.1:8790` | TCP del CLI | lo que usan los agentes |
+
+**Por que hace falta Marionette.** Hay capacidades que no existen para una
+WebExtension, no que sean_difficiles_: `window.alert()` y `confirm()` no se
+exponen a las extensiones, `DOM.setFileInputFiles` es CDP puro, y no hay API
+para instalar una extension sin consentimiento del usuario. Marionette las
+resuelve porque controla el navegador por dentro.
+
+### `--marionette` es obligatorio
+
+Zen **debe** lanzarse con `--marionette`. Sin ese flag no se abre el puerto
+2828, el MCP firefox-devtools se desconecta, y media capacidad desaparece sin
+avisar. Los tres lanzadores que deben llevarlo:
+
+- `package.sh --restart-zen`
+- el atajo `Mod+Z` de niri (`spawn "zen-browser --marionette"`)
+- cualquier `setsid zen-browser` manual
+
+Todos los puertos escuchan **solo en loopback**. No cambiarlos a `0.0.0.0`.
+
+### Reparto recomendado
+
+| Necesidad | Usar |
+|---|---|
+| navegar, leer, hacer clic, escribir texto, capturas | Zen Live (WebExtension) |
+| cookies de X / Reddit / WhatsApp | Zen Live: es la sesion real |
+| `alert` / `confirm` que bloquean la pagina | Marionette |
+| subir un fichero a `<input type=file>` | Marionette |
+| instalar o quitar una extension | Marionette |
+

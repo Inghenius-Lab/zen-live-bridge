@@ -94,7 +94,12 @@ if [[ "${1:-}" == "--restart-zen" ]]; then
   if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
     echo "AVISO: no hay WAYLAND_DISPLAY; Zen no abrira ventana (sesion sin Wayland?)" >&2
   fi
-  setsid -f "$(command -v zen-browser)" >/dev/null 2>&1 || true
+  # --marionette NO es opcional: abre 127.0.0.1:2828, que es por donde el
+  # MCP firefox-devtools se conecta al MISMO Zen. Sin este flag, el segundo
+  # backend no existe y todo lo que la WebExtension no puede hacer (alert/
+  # confirm, subir ficheros, instalar extensions) se queda sin cobertura.
+  # Solo escucha en loopback, como el resto.
+  setsid -f "$(command -v zen-browser)" --marionette >/dev/null 2>&1 || true
   sleep 20
   zen-live status 2>&1 | tail -2
 fi
