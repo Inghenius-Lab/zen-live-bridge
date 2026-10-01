@@ -29,6 +29,11 @@ zen-live links [--filter DOMINIO]       # extrae hrefs (scraping/investigacion)
 zen-live wait --sel CSS | --text T      # espera a que aparezca (SPAs lentas)
 zen-live select --sel CSS --values a,b  # <select> nativo (casi nadie lo usa ya)
 zen-live exists --sel CSS               # booleano sin eval, funciona bajo CSP
+zen-live locate --sel CSS | --text T    # coordenadas SIN clicar (resuelve CSP)
+zen-live annotate [--tab N]             # overlay numerado sobre los interactuables
+zen-live click-at N                     # clic por indice del overlay
+zen-live console [--clear]              # buffer de console de la pagina
+zen-live set-range --sel CSS --value V  # input[type=range]; avisa si la pagina reescribe
 # casi todos aceptan --tab N para no depender de la pestanya activa
 zen-live click --sel CSS   # clic real
 zen-live fill --sel CSS --value V [--submit]

@@ -179,20 +179,410 @@ function fnScroll(px, dir, sel) {
     matched: sel ? !!document.querySelector(sel) : null
   });
 }
-function fnClick(sel, txt) {
-  let el = null;
-  if (sel) el = document.querySelector(sel);
-  if (!el && txt) el = [...document.querySelectorAll('a,button,[role=button],input[type=submit],summary')].find(e => ((e.innerText || e.value || '') + '').trim().includes(txt));
-  if (!el) return JSON.stringify({ ok: false, error: "elemento no encontrado" });
-  el.scrollIntoView({ block: 'center' });
-  const opts = { bubbles: true, cancelable: true, view: window };
-  try { el.dispatchEvent(new PointerEvent('pointerdown', opts)); } catch (e) {}
-  el.dispatchEvent(new MouseEvent('mousedown', opts));
-  try { el.dispatchEvent(new PointerEvent('pointerup', opts)); } catch (e) {}
-  el.dispatchEvent(new MouseEvent('mouseup', opts));
-  try { el.click(); } catch (e) { el.dispatchEvent(new MouseEvent('click', opts)); }
-  return JSON.stringify({ ok: true, tag: el.tagName.toLowerCase(), text: ((el.innerText || el.value || '') + '').trim().slice(0, 60) });
+/* Una sola funcion inyectada. scripting.executeScript serializa la funcion y
+   la ejecuta en la pagina: los helpers de fuera NO existen ahi dentro, por
+   eso todo (helpers + dispatch) va dentro de esta unica funcion. */
+function fnMaster(cmd, a, b, c) {
+  const J = o => JSON.stringify(o);
+  const box = el => {
+    const r = el.getBoundingClientRect();
+    const st = getComputedStyle(el);
+    return { r, vis: r.width > 0 && r.height > 0 &&
+                   st.visibility !== 'hidden' && st.display !== 'none' };
+  };
+  const SEL = 'a[href],button,input:not([type=hidden]),textarea,select,summary,' +
+    '[role=button],[role=link],[role=tab],[role=menuitem],[contenteditable=""],[contenteditable=true],[onclick]';
+  const list = sel => [...document.querySelectorAll(sel || SEL)].filter(e => box(e).vis);
+  const on = el => !el.disabled && el.getAttribute('aria-disabled') !== 'true' && !el.readOnly;
+  const label = el => ((el.innerText || el.value || el.textContent || '') + '').trim();
+
+  // Click con coordenadas reales en TODOS los eventos, incluido el final.
+  // HTMLElement.click() pone clientX/clientY en cero, y eso manda un arrastre
+  // de slider o de barra de video a la posicion 0. Despues del click solo se
+  // llama el() para checkbox/radio, que no cambian con un click sintetico.
+  function doClick(el) {
+    if (!on(el)) return { ok: false, error: 'elemento deshabilitado o read-only' };
+    el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+    const r = el.getBoundingClientRect();
+    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    const o = { bubbles: true, cancelable: true, composed: true, view: window,
+                clientX: x, clientY: y, button: 0, buttons: 1, detail: 1 };
+    const up = Object.assign({}, o, { buttons: 0 });
+    try { el.dispatchEvent(new PointerEvent('pointermove', up)); } catch (e) {}
+    try { el.dispatchEvent(new MouseEvent('mousemove', up)); } catch (e) {}
+    try { el.dispatchEvent(new PointerEvent('pointerdown', o)); } catch (e) {}
+    el.dispatchEvent(new MouseEvent('mousedown', o));
+    try { el.dispatchEvent(new PointerEvent('pointerup', up)); } catch (e) {}
+    el.dispatchEvent(new MouseEvent('mouseup', up));
+    const chk = el.matches('input[type=checkbox],input[type=radio]') ? el.checked : null;
+    el.dispatchEvent(new MouseEvent('click', up));
+    if (chk !== null && el.checked === chk) { try { el.click(); } catch (e) {} }
+    return { ok: true, tag: el.tagName.toLowerCase(), x: Math.round(x), y: Math.round(y),
+             text: label(el).slice(0, 60) };
+  }
+
+  switch (cmd) {
+    case 'click': {
+      let el = null;
+      if (a) {
+        const els = list(a);
+        el = (c !== null && els[c]) ? els[c] : (els[0] || document.querySelector(a));
+      }
+      if (!el && b) el = list(null).find(e => label(e).includes(b));
+      if (!el) return J({ ok: false, error: 'elemento no encontrado' });
+      return J(doClick(el));
+    }
+    // Localiza SIN clicar: cuando eval esta bloqueado por CSP, el agente pide
+    // coordenadas y clica de verdad, sin buscar en el DOM con js.
+    case 'locate': {
+      let el = null;
+      if (a) { const els = list(a); el = (c !== null && els[c]) ? els[c] : els[0]; }
+      if (!el && b) {
+        el = [...document.querySelectorAll('a,button,[role=button],summary,label,h1,h2,h3')]
+          .find(e => label(e).includes(b));
+      }
+      if (!el) return J({ ok: false, error: 'no encontrado para locate' });
+      const r = el.getBoundingClientRect();
+      return J({ ok: true, tag: el.tagName.toLowerCase(),
+                 x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2),
+                 w: Math.round(r.width), h: Math.round(r.height),
+                 inViewport: r.top >= 0 && r.bottom <= (window.innerHeight || 0),
+                 text: label(el).slice(0, 70) });
+    }
+    // Overlay con numeros sobre cada interactuable, para que un agente con
+    // vision vea la captura y luego haga click-at N. pointer-events:none.
+    case 'annotate': {
+      const old = document.getElementById('__zen_live_overlay');
+      if (old) old.remove();
+      if (a) return J({ ok: true, cleared: true });
+      const ov = document.createElement('div');
+      ov.id = '__zen_live_overlay';
+      ov.style.cssText = 'position:absolute;left:0;top:0;width:0;height:0;' +
+                         'z-index:2147483647;pointer-events:none';
+      document.body.appendChild(ov);
+      const items = [];
+      list(null).slice(0, 60).forEach((el, i) => {
+        const r = el.getBoundingClientRect();
+        const L = r.left + window.scrollX, T = r.top + window.scrollY;
+        const bx = document.createElement('div');
+        bx.style.cssText = 'position:absolute;left:' + L + 'px;top:' + T + 'px;width:' +
+          r.width + 'px;height:' + r.height + 'px;border:2px solid #d00;box-sizing:border-box';
+        const lb = document.createElement('div');
+        lb.textContent = String(i + 1);
+        lb.style.cssText = 'position:absolute;left:' + (L - 2) + 'px;top:' + (T - 16) +
+          'px;background:#d00;color:#fff;font:bold 11px monospace;padding:1px 3px;border-radius:2px';
+        ov.appendChild(bx); ov.appendChild(lb);
+        items.push({ n: i + 1, tag: el.tagName.toLowerCase(), text: label(el).slice(0, 50) });
+      });
+      return J({ ok: true, count: items.length, items });
+    }
+    case 'click-at': {
+      const el = list(null)[Number(a) - 1];
+      if (!el) return J({ ok: false, error: 'indice fuera de rango: ' + a });
+      const r = doClick(el);
+      r.n = Number(a);
+      return J(r);
+    }
+    // Buffer de console. Se instala en la primera llamada y vive en la
+    // pagina; si hay navegacion se reinstala en la siguiente.
+    case 'console': {
+      const K = '__zenLiveConsole';
+      if (!window[K]) {
+        const ent = [];
+        const ser = v => {
+          const t = v === null ? 'null' : typeof v;
+          if (t === 'string' || t === 'number' || t === 'boolean') return t + ':' + String(v);
+          try { return t + ':' + JSON.stringify(v); } catch (e) { return t + ':' + String(v); }
+        };
+        for (const lv of ['log', 'info', 'warn', 'error', 'debug']) {
+          const orig = console[lv] && console[lv].bind(console);
+          if (!orig) continue;
+          console[lv] = function () {
+            try {
+              ent.push({ type: lv, at: Date.now(),
+                         text: Array.prototype.map.call(arguments, ser).join(' ').slice(0, 500) });
+              if (ent.length > 500) ent.shift();
+            } catch (e) {}
+            return orig.apply(null, arguments);
+          };
+        }
+        window[K] = ent;
+      }
+      const out = window[K].slice();
+      if (b) window[K].length = 0;
+      return J({ ok: true, count: out.length, entries: out.slice(-40) });
+    }
+    // Setter del prototype: si se asigna el .value a mano, los frameworks con
+    // valor rastreado lo ignoran en silencio. observed != requested delata un
+    // control que reescribio el valor, o sea que el set no sirvio.
+    case 'set-range': {
+      const els = [...document.querySelectorAll(a || 'input[type=range]')];
+      const el = (c !== null && els[c]) ? els[c] : els[0];
+      if (!el) return J({ ok: false, error: 'input[type=range] no encontrado' });
+      if (!el.matches('input[type=range]'))
+        return J({ ok: false, error: 'solo input[type=range]; para slider custom usa locate o click-at' });
+      const mn = el.min === '' ? 0 : Number(el.min), mx = el.max === '' ? 100 : Number(el.max);
+      const v = Number(b);
+      if (!isFinite(v) || v < mn || v > mx)
+        return J({ ok: false, error: 'valor fuera de rango ' + mn + '-' + mx });
+      const d = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+      if (d && d.set) d.set.call(el, String(v)); else el.value = String(v);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return J({ ok: true, requested: v, observed: Number(el.value), min: mn, max: mx,
+                 trusted: Math.abs(Number(el.value) - v) < 1e-6 });
+    }
+    case 'exists': {
+      if (a) {
+        const el = document.querySelector(a);
+        return J({ ok: true, found: !!el, tag: el ? el.tagName.toLowerCase() : null });
+      }
+      const t = (document.body ? document.body.innerText : '') + '';
+      return J({ ok: true, found: t.toLowerCase().indexOf(String(b).toLowerCase()) !== -1 });
+    }
+    case 'select': {
+      const el = document.querySelector(a);
+      if (!el) return J({ ok: false, error: 'select no encontrado: ' + a });
+      const vals = Array.isArray(b) ? b : [b];
+      const done = [];
+      for (const v of vals) {
+        const o = [...el.options].find(x => x.value === v || (x.textContent || '').trim() === v);
+        if (o) { o.selected = true; done.push(v); }
+      }
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return J({ ok: true, applied: done, total: el.options.length });
+    }
+    default:
+      return J({ ok: false, error: 'comando desconocido: ' + cmd });
+  }
 }
+
+function fnExists(sel, text) {
+  if (sel) {
+    const el = document.querySelector(sel);
+    return JSON.stringify({ ok: true, found: !!el, tag: el ? el.tagName.toLowerCase() : null });
+  }
+  const t = (document.body ? document.body.innerText : '') + '';
+  return JSON.stringify({ ok: true, found: t.toLowerCase().indexOf(String(text).toLowerCase()) !== -1 });
+}
+
+function fnSelect(sel, values) {
+  const el = document.querySelector(sel);
+  if (!el) return JSON.stringify({ ok: false, error: 'select no encontrado: ' + sel });
+  const vals = Array.isArray(values) ? values : [values];
+  const done = [];
+  for (const v of vals) {
+    const opt = [...el.options].find(o => o.value === v || (o.textContent || '').trim() === v);
+    if (opt) { opt.selected = true; done.push(v); }
+  }
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  return JSON.stringify({ ok: true, applied: done, total: el.options.length });
+}
+function fnScroll(px, dir, sel) {
+  const before = window.scrollY;
+  const d = dir === 'up' ? -1 : 1;
+  if (sel) {
+    const el = document.querySelector(sel);
+    if (el) { el.scrollIntoView({ block: dir === 'up' ? 'start' : 'end' }); }
+  } else {
+    window.scrollBy(0, d * Math.abs(px));
+  }
+  // scrollBy con comportamiento instantaneo: despues el render de la SPA
+  // sigue, asi que el llamador debe dormir --wait antes de leer texto.
+  return JSON.stringify({
+    ok: true, before, after: window.scrollY,
+    delta: window.scrollY - before,
+    height: document.body ? document.body.scrollHeight : 0,
+    matched: sel ? !!document.querySelector(sel) : null
+  });
+}
+function interactable(el) {
+  return el.matches('a[href],button,input:not([type=hidden]),textarea,select,summary,' +
+    '[role=button],[role=link],[role=tab],[role=menuitem],[contenteditable=""],[contenteditable=true],[onclick]') ||
+    (el.tagName === 'A' && el.href);
+}
+function visibleBox(el) {
+  const r = el.getBoundingClientRect();
+  const vis = (r.width > 0 && r.height > 0) &&
+    (getComputedStyle(el).visibility !== 'hidden') &&
+    (getComputedStyle(el).display !== 'none');
+  return { r, vis };
+}
+function enabledEl(el) {
+  return !el.disabled && el.getAttribute('aria-disabled') !== 'true' && !el.readOnly;
+}
+// Enumeracion determinista: la misma para annotate y para click-at, de modo
+// que el indice N significa el mismo elemento en ambas llamadas mientras el
+// DOM no cambie.
+function interactiveList(sel) {
+  const sel2 = sel || 'a[href],button,input:not([type=hidden]),textarea,select,summary,' +
+    '[role=button],[role=link],[role=tab],[role=menuitem],[contenteditable=""],[contenteditable=true],[onclick]';
+  return [...document.querySelectorAll(sel2)].filter(e => visibleBox(e).vis);
+}
+
+function fnClick(sel, txt, nth) {
+  let el = null;
+  if (sel) {
+    const els = interactiveList(sel);
+    el = (nth !== undefined && els[nth]) ? els[nth] : (els[0] || document.querySelector(sel));
+  }
+  if (!el && txt) {
+    el = [...document.querySelectorAll('a,button,[role=button],input[type=submit],summary')]
+      .find(e => ((e.innerText || e.value || '') + '').trim().includes(txt));
+  }
+  if (!el) return JSON.stringify({ ok: false, error: 'elemento no encontrado' });
+  if (!enabledEl(el)) return JSON.stringify({ ok: false, error: 'elemento deshabilitado o read-only' });
+  const { r } = visibleBox(el);
+  el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+  const box = el.getBoundingClientRect();
+  const x = box.left + box.width / 2, y = box.top + box.height / 2;
+  const o = { bubbles: true, cancelable: true, composed: true, view: window,
+              clientX: x, clientY: y, button: 0, buttons: 1, detail: 1 };
+  // Secuencia completa con coordenadas en TODOS los eventos, incluido el
+  // click final. HTMLElement.click() pone las coordenadas en cero y eso
+  // rompe los sliders (el arrastre de un video o una barra de progreso se
+  // va a 0). Ademas se pierde la activacion nativa, asi que despues del
+  // click solo se llama el() para checkbox/radio que no cambian de estado
+  // con un click sintetico.
+  try { el.dispatchEvent(new PointerEvent('pointermove', Object.assign({}, o, { buttons: 0 }))); } catch (e) {}
+  try { el.dispatchEvent(new MouseEvent('mousemove', Object.assign({}, o, { buttons: 0 }))); } catch (e) {}
+  try { el.dispatchEvent(new PointerEvent('pointerdown', o)); } catch (e) {}
+  el.dispatchEvent(new MouseEvent('mousedown', o));
+  try { el.dispatchEvent(new PointerEvent('pointerup', Object.assign({}, o, { buttons: 0 }))); } catch (e) {}
+  el.dispatchEvent(new MouseEvent('mouseup', Object.assign({}, o, { buttons: 0 })));
+  const check = el.matches('input[type=checkbox],input[type=radio]') ? el.checked : null;
+  el.dispatchEvent(new MouseEvent('click', Object.assign({}, o, { buttons: 0 })));
+  if (check !== null && el.checked === check) { try { el.click(); } catch (e) {} }
+  return JSON.stringify({ ok: true, tag: el.tagName.toLowerCase(), x: Math.round(x), y: Math.round(y),
+                          text: ((el.innerText || el.value || '') + '').trim().slice(0, 60) });
+}
+
+// Localiza SIN hacer clic. Sirve cuando eval esta bloqueado por CSP: en vez
+// de buscar en el DOM con js, el agente pide coordenadas y hace clic real.
+function fnLocate(sel, txt, nth) {
+  const els = interactiveList(sel);
+  let el = (nth !== undefined && els[nth]) ? els[nth] : els[0];
+  if (!el && txt) {
+    el = [...document.querySelectorAll('a,button,[role=button],summary,label,h1,h2,h3')]
+      .find(e => ((e.innerText || e.textContent || '') + '').trim().includes(txt));
+  }
+  if (!el) return JSON.stringify({ ok: false, error: 'no encontrado para locate' });
+  const { r } = visibleBox(el);
+  return JSON.stringify({ ok: true, tag: el.tagName.toLowerCase(),
+                          x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2),
+                          w: Math.round(r.width), h: Math.round(r.height),
+                          inViewport: r.top >= 0 && r.bottom <= (window.innerHeight || 0),
+                          text: ((el.innerText || el.value || el.textContent || '') + '').trim().slice(0, 70) });
+}
+
+// Dibuja un overlay con numeros sobre cada elemento interactuable. Pensado
+// para vision: el agente ve la captura con numeros y luego hace clic-at N.
+// El overlay es pointer-events:none, asi que no estorba a la pagina.
+function fnAnnotate(clear) {
+  const old = document.getElementById('__zen_live_overlay');
+  if (clear) {
+    if (old) old.remove();
+    return JSON.stringify({ ok: true, cleared: true });
+  }
+  if (old) old.remove();
+  const ov = document.createElement('div');
+  ov.id = '__zen_live_overlay';
+  ov.style.cssText = 'position:absolute;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none';
+  document.body.appendChild(ov);
+  const items = [];
+  const els = interactiveList(null);
+  els.slice(0, 60).forEach((el, i) => {
+    const r = el.getBoundingClientRect();
+    const n = i + 1;
+    const box = document.createElement('div');
+    box.style.cssText = `position:absolute;left:${r.left + window.scrollX}px;top:${r.top + window.scrollY}px;` +
+      `width:${r.width}px;height:${r.height}px;border:2px solid #d00;box-sizing:border-box`;
+    const lab = document.createElement('div');
+    lab.textContent = String(n);
+    lab.style.cssText = `position:absolute;left:${r.left + window.scrollX - 2}px;top:${r.top + window.scrollY - 16}px;` +
+      `background:#d00;color:#fff;font:bold 11px monospace;padding:1px 3px;border-radius:2px`;
+    ov.appendChild(box); ov.appendChild(lab);
+    items.push({ n, tag: el.tagName.toLowerCase(),
+                 text: ((el.innerText || el.value || el.textContent || '') + '').trim().slice(0, 50) });
+  });
+  return JSON.stringify({ ok: true, count: items.length, items });
+}
+
+function fnClickAt(n) {
+  const idx = Number(n) - 1;
+  const el = interactiveList(null)[idx];
+  if (!el) return JSON.stringify({ ok: false, error: 'indice fuera de rango: ' + n });
+  if (!enabledEl(el)) return JSON.stringify({ ok: false, error: 'elemento deshabilitado' });
+  el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+  const box = el.getBoundingClientRect();
+  const x = box.left + box.width / 2, y = box.top + box.height / 2;
+  const o = { bubbles: true, cancelable: true, composed: true, view: window,
+              clientX: x, clientY: y, button: 0, buttons: 1, detail: 1 };
+  try { el.dispatchEvent(new PointerEvent('pointerdown', o)); } catch (e) {}
+  el.dispatchEvent(new MouseEvent('mousedown', o));
+  try { el.dispatchEvent(new PointerEvent('pointerup', Object.assign({}, o, { buttons: 0 }))); } catch (e) {}
+  el.dispatchEvent(new MouseEvent('mouseup', Object.assign({}, o, { buttons: 0 })));
+  const check = el.matches('input[type=checkbox],input[type=radio]') ? el.checked : null;
+  el.dispatchEvent(new MouseEvent('click', Object.assign({}, o, { buttons: 0 })));
+  if (check !== null && el.checked === check) { try { el.click(); } catch (e) {} }
+  return JSON.stringify({ ok: true, n: Number(n), tag: el.tagName.toLowerCase(),
+                          x: Math.round(x), y: Math.round(y),
+                          text: ((el.innerText || el.value || '') + '').trim().slice(0, 50) });
+}
+
+// Captura de console. Se instala la primera vez y se queda en la pagina; si
+// hay navegacion se pierde y se reinstala en la siguiente llamada.
+function fnConsole(clear) {
+  const KEY = '__zenLiveConsole';
+  if (!window[KEY]) {
+    const entries = [];
+    const ser = v => {
+      const t = v === null ? 'null' : typeof v;
+      if (t === 'string' || t === 'number' || t === 'boolean') return t + ':' + String(v);
+      try { return t + ':' + JSON.stringify(v); } catch (e) { return t + ':' + String(v); }
+    };
+    for (const lvl of ['log', 'info', 'warn', 'error', 'debug']) {
+      const orig = console[lvl] && console[lvl].bind(console);
+      if (!orig) continue;
+      console[lvl] = function () {
+        try {
+          entries.push({ type: lvl, text: [...arguments].map(ser).join(' ').slice(0, 500),
+                         at: Date.now() });
+          if (entries.length > 500) entries.shift();
+        } catch (e) {}
+        return orig.apply(null, arguments);
+      };
+    }
+    window[KEY] = entries;
+  }
+  const out = window[KEY].slice();
+  if (clear) window[KEY].length = 0;
+  return JSON.stringify({ ok: true, count: out.length, entries: out.slice(-40) });
+}
+
+function fnSetRange(sel, value, nth) {
+  const els = [...document.querySelectorAll(sel || 'input[type=range]')];
+  const el = (nth !== undefined && els[nth]) ? els[nth] : els[0];
+  if (!el) return JSON.stringify({ ok: false, error: 'input[type=range] no encontrado' });
+  if (!el.matches('input[type=range]'))
+    return JSON.stringify({ ok: false, error: 'solo input[type=range]; para sliders custom usa click-at o locate' });
+  const min = el.min === '' ? 0 : Number(el.min), max = el.max === '' ? 100 : Number(el.max);
+  const v = Number(value);
+  if (!isFinite(v) || v < min || v > max)
+    return JSON.stringify({ ok: false, error: 'valor fuera de rango ' + min + '-' + max });
+  // Setter del prototype: si no, los frameworks con valor rastreado lo ignoran.
+  const d = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+  if (d && d.set) d.set.call(el, String(v)); else el.value = String(v);
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  // observed != requested delata un slider que reescribio el valor: no es
+  // trustworthy afirmar exito sin mirar observed.
+  return JSON.stringify({ ok: true, requested: v, observed: Number(el.value),
+                          min, max, trusted: Math.abs(Number(el.value) - v) < 1e-6 });
+}
+
 function fnFill(sel, value, submitEnter, nth) {
   let els = sel ? [...document.querySelectorAll(sel)].filter(e => e.offsetWidth || e.isContentEditable) : [];
   let el = (nth !== undefined && els[nth]) ? els[nth] : (els[0] || null);
@@ -531,16 +921,25 @@ case "key": {
       return { ok: true, tabId: tab, ...JSON.parse(out.raw) };
     }
 
-    case "exists": {
+    case "locate":
+    case "annotate":
+    case "click-at":
+    case "console":
+    case "set-range":
+    case "exists":
+    case "select": {
       const tab = msg.tabId || (await activeTab()).id;
-      const out = await execFn(tab, fnExists, [msg.sel || "", msg.text || ""]);
+      const out = await execFn(tab, fnMaster,
+        [msg.cmd, msg.sel !== undefined ? msg.sel : (msg.text !== undefined ? msg.text : msg.n),
+         msg.text !== undefined ? msg.text : (msg.value !== undefined ? msg.value : !!msg.clear),
+         msg.nth !== undefined ? msg.nth : null]);
       if (!out.ok) return out;
       return { ok: true, tabId: tab, ...JSON.parse(out.raw) };
     }
 
-    case "select": {
+    case "click": {
       const tab = msg.tabId || (await activeTab()).id;
-      const out = await execFn(tab, fnSelect, [msg.sel || "", msg.values || []]);
+      const out = await execFn(tab, fnMaster, ["click", msg.sel || "", msg.text || "", msg.nth ?? null]);
       if (!out.ok) return out;
       return { ok: true, tabId: tab, ...JSON.parse(out.raw) };
     }

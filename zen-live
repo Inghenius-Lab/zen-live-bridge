@@ -23,6 +23,7 @@ Requiere: la extension "Zen Live Bridge" cargada en Zen (about:debugging o
 instalada). Sin extension, ping falla con mensaje claro.
 """
 import base64, json, os, socket, subprocess, sys, time
+from sys import argv
 
 TCP_PORT = int(os.environ.get("ZEN_LIVE_TCP", "8790"))  # 8787 = stt-server (canonico ecosistema)
 WS_PORT = int(os.environ.get("ZEN_LIVE_WS", "8788"))
@@ -308,6 +309,62 @@ def main():
                                   % (timeout, sel or txt)}, ensure_ascii=False))
                 return
             time.sleep(paso / 1000.0)
+
+    if cmd == "locate":
+        r = send({"cmd": "locate", "sel": opt("--sel", ""), "text": opt("--text", ""),
+                  "nth": int(opt("--nth", "")) if opt("--nth", "") else None,
+                  "tabId": int(opt("--tab", "0")) or None})
+        if r.get("ok"):
+            print("x={x} y={y} {tag} {w}x{h} inViewport={v}".format(
+                x=r.get("x"), y=r.get("y"), tag=r.get("tag"),
+                w=r.get("w"), h=r.get("h"), v=r.get("inViewport")))
+            print("  texto: %s" % (r.get("text", "")[:70]))
+            if not r.get("inViewport"):
+                print("  aviso: fuera del viewport, scrollea antes de clicar por coordenadas")
+        else:
+            print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "annotate":
+        r = send({"cmd": "annotate", "clear": "clear" in sys.argv,
+                  "tabId": int(opt("--tab", "0")) or None})
+        if r.get("ok") and not r.get("cleared"):
+            print("%d elementos interactuables numerados (pointer-events:none)" % r.get("count", 0))
+            for it in r.get("items", [])[:25]:
+                print("  %2d %-8s %s" % (it.get("n"), it.get("tag"), it.get("text", "")[:52]))
+            if r.get("count", 0) > 25:
+                print("  ... %d mas" % (r.get("count", 0) - 25))
+            print("luego: zen-live click-at N   (o 'zen-live annotate clear' para quitarlo)")
+        else:
+            print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "click-at":
+        r = send({"cmd": "click-at", "n": argv[2] if len(argv) > 2 else "0",
+                  "tabId": int(opt("--tab", "0")) or None})
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return
+
+    if cmd == "console":
+        r = send({"cmd": "console", "clear": "--clear" in sys.argv,
+                  "tabId": int(opt("--tab", "0")) or None})
+        if r.get("ok"):
+            print("%d entradas de console" % r.get("count", 0))
+            for e in r.get("entries", []):
+                print("  [%-5s] %s" % (e.get("type"), e.get("text", "")[:110]))
+        else:
+            print(json.dumps(r, ensure_ascii=False))
+        return
+
+    if cmd == "set-range":
+        r = send({"cmd": "set-range", "sel": opt("--sel", ""),
+                  "value": float(opt("--value", "0")) if opt("--value", "") else 0,
+                  "tabId": int(opt("--tab", "0")) or None})
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        if r.get("ok") and not r.get("trusted"):
+            print("AVISO: la pagina reescribio el valor (pedido %s, real %s). "
+                  "El control ignoro el set." % (r.get("requested"), r.get("observed")))
+        return
 
     if cmd == "scroll":
         a = sys.argv
