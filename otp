@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""otp: saca un codigo de verificacion del correo SIN persistirlo.
+
+El codigo se imprime una vez y no se guarda en ningun fichero, ni en el
+historial de zen-live, ni en el log del puente. Cada invocacion relee el
+correo: no hay estado entre llamadas.
+"""
+import argparse, os, re, subprocess, sys, time
+
+# Ventanas de caducidad: Google 6 digitos/10 min, GitHub 6/10, AWS 6/15.
+CODE = re.compile(r"(?<![0-9])(\d{6})(?![0-9])")
+# Solo remitentes o asuntos que de verdad son codigos de acceso.
+SENDER = re.compile(
+    r"(no-?reply|noreply|accounts?@|security@|verify@|auth@|login@|"
+    r"support@|do-not-reply)", re.I)
+SUBJECT = re.compile(
+    r"(c[oó]digo|code|verification|verifica|2fa|otp|one[- ]time|"
+    r"security alert|login|access|sign[- ]in|autentic)", re.I)
+# Palabras que delatan un codigo dentro del cuerpo.
+BODY = re.compile(
+    r"(c[oó]digo|code|c[oó]digo de seguridad|verification code|one[- ]time|"
+    r"2fa|otp|passcode|clave)", re.I)
+
+
+def run(cmd, timeout=60):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+
+
+def candidates(account, minutes, unread_only):
+    """Devuelve (id, asunto, from) de correos que PODRIAN llevar codigo."""
+    since = time.strftime("%Y-%m-%d", time.localtime(time.time() - minutes * 60))
+    args = ["himalaya", "envelope", "list", "-a", account, "-s", "25",
+            "-d", since, "--output", "json"]
+    if unread_only:
+        args.append("-f")
+    try:
+        import json
+        rows = json.loads(run(args) or "[]")
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        subj = r.get("subject", "") or ""
+        frm = r.get("from", {}) or {}
+        name = "%s %s" % (frm.get("name") or "", frm.get("addr") or "")
+        if SENDER.search(name) or SUBJECT.search(subj):
+            out.append((r.get("id"), subj, name.strip()))
+    return out
+
+
+def extract(account, minutes, unread_only):
+    for mid, subj, frm in candidates(account, minutes, unread_only):
+        body = run(["himalaya", "message", "read", "-a", account, "-s", str(mid),
+                    "-H", "-o", "text"], 45)
+        if not body or not BODY.search(body):
+            continue
+        # Preferir el codigo mas cercano a la palabra clave.
+        # El codigo puede estar ANTES o DESPUES de la palabra clave:
+        # Google pone "tu codigo es 123456", GitHub pone "123456 es tu codigo".
+        # Por eso se mira una ventana a cada lado y no solo hacia delante.
+        best = None
+        KW = r"(?:c[oó]digo|code|passcode|otp|2fa)"
+        for m in re.finditer(r"([^\n]{0,40}" + KW + r"[^\n]{0,60})", body, re.I):
+            c = CODE.search(m.group(1))
+            if c:
+                best = c.group(1)
+                break
+        if best is None:
+            c = CODE.search(body)
+            if c:
+                best = c.group(1)
+        if best:
+            return {"ok": True, "code": best, "from": frm,
+                    "subject": subj[:70], "account": account}
+    return {"ok": False, "error": "sin codigo en los ultimos %d min" % minutes}
+
+
+def main():
+    p = argparse.ArgumentParser(prog="otp", add_help=True)
+    p.add_argument("account", nargs="?", default="morales")
+    p.add_argument("--minutes", type=int, default=15)
+    p.add_argument("--all", action="store_true",
+                   help="no filtrar por remitente/asunto (mas ruidoso)")
+    a = p.parse_args()
+    r = extract(a.account, a.minutes, not a.all)
+    if r["ok"]:
+        # Solo el codigo sale por stdout. Nada mas se imprime ni se guarda.
+        print(r["code"])
+    else:
+        print(r["error"], file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

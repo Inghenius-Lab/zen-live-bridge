@@ -242,3 +242,48 @@ Las tres encadenan: `recall "tema"` -> `zen-live history TEMA` -> `goto URL`
 para volver a una pagina sin buscarla de nuevo. `history` es el puente entre
 "me acuerdo de que estuve ahi" y "vuelve alla".
 
+## Codigos de verificacion desde el correo (`otp`)
+
+```bash
+./otp                      # cuenta por defecto (morales), ultimos 15 min
+./otp kike --minutes 30    # otra cuenta y otra ventana
+./otp --all                # sin filtrar por remitente/asunto (ruidoso)
+```
+
+Imprime **solo el codigo** por stdout. No se guarda en ningun sitio: ni en el
+historial de zen-live, ni en el log del puente, ni en ningun fichero. Cada
+llamada relee el correo, asi que no hay estado entre invocaciones.
+
+```bash
+CODE=$(./otp morales) && zen-live fill '#code' "$CODE" --tab N
+```
+
+### Por que NO es lo mismo que KeePassXC
+
+KeePassXC genera los TOTP **dentro del navegador** y el codigo nunca pasa por
+el contexto del agente: la extension lo inyecta directamente en el campo. Es
+estrictamente mejor. `otp` cubre el caso que KeePass no cubre: servicios que
+mandan el codigo **por correo** y no por TOTP.
+
+El correo es un canal menos seguro que TOTP (quien tenga la cuenta puede
+pedir un reenvio). Por eso:
+
+- Filtra por remitente y asunto: solo `no-reply`, `security@`, `verify@` o
+  asuntos con `codigo`/`verification`/`2fa`/`login`.
+- Exige una palabra clave (`codigo`, `code`, `2fa`, `passcode`) **cerca** del
+  numero. Un PIN suelto o una fecha no se toman.
+- Solo 6 digitos, y no como parte de un numero mas largo.
+
+Verificado con 10 casos (`test-otp.py`, 0 fallos), incluyendo los dos formatos
+que rompen un extractor ingenuo: Google pone el codigo **despues** de la
+palabra clave ("tu codigo es 123456") y GitHub lo pone **antes** ("123456 es
+tu codigo"). El extractor mira una ventana a ambos lados.
+
+### Que NO cubre
+
+- CAPTCHA de reCAPTCHA / Cloudflare / hCaptcha: son antibot por diseno. Para
+  imagen/texto, `tesseract` ya esta instalado y se puede usar con un recorte.
+  reCAPTCHA lo resuelve Buster (extension, Firefox incluido) por audio.
+- Contrasenas. No hay ninguna API WebExtension para leerlas, y no se anade una:
+  las credenciales van en el gestor del navegador.
+
