@@ -45,9 +45,65 @@ zen-live close TABID       # cierra pestaña creada por el agente
 ```
 
 ## Seguridad
-- Escucha **solo** en localhost.
-- La extensión habla únicamente con `ws://127.0.0.1:8788`.
-- No envía nada a internet; no incluye telemetría.
+
+El puente maneja la sesión ya autenticada del usuario, así que no es un detalle
+cosmético. Kimi WebBridge documenta explícitamente que su puerto 10086 no tiene
+frontera de seguridad ("any localhost process can connect"); aquí hay token.
+
+**Cómo funciona**
+
+- Token compartido en `~/.local/state/zen-live-bridge/token`, permisos `0600`,
+  generado la primera vez con `secrets.token_urlsafe(32)`.
+- El CLI lo lee en cada envío y lo manda en cada comando JSON.
+- La extensión lo lleva en la query del WebSocket: `/?t=TOKEN`. Una
+  WebExtension no puede leer archivos locales, así que `package.sh` lo inyecta
+  al empaquetar. Por eso el `.xpi` está en `.gitignore`: lleva el secreto dentro.
+- El WS también rechaza cualquier `Origin` que no sea `moz-extension://`.
+
+**Qué protege y qué no, sin adornos**
+
+| | |
+|---|---|
+| Protege | páginas web (no pueden leer un archivo `0600`), otros usuarios de la misma máquina, conexiones accidentales y el vector de red |
+| NO protege | un proceso que ya corre como este usuario: puede leer el archivo del token igual que cualquier otra cosa |
+
+Contra un atacante con ejecución como tu usuario ningún secreto en disco
+sirve; haría falta aislamiento de procesos o un socket con permisos. Decirlo
+claro es parte de la documentación, no una excusoria.
+
+Ambos sockets hacen bind solo a `127.0.0.1`, así que no hay exposición a la LAN.
+No se envía nada a internet; no hay telemetría.
+
+**Verificado** con tres ataques y un caso legítimo:
+
+```
+proceso local sin token     -> ok: false, "token invalido"
+página web (Origin falso)   -> HTTP/1.1 401 Unauthorized
+token adivinado             -> HTTP/1.1 401 Unauthorized
+CLI con el token correcto   -> lista las pestañas
+```
+
+**Rotar el token**
+
+```bash
+rm ~/.local/state/zen-live-bridge/token
+systemctl --user restart zen-live-bridge.service
+./package.sh --restart-zen        # re-inyecta el token nuevo en la extensión
+```
+
+## Empaquetar
+
+```bash
+./package.sh                  # solo construye el .xpi con el token inyectado
+./package.sh --install        # además lo copia al perfil de Zen y borra startupCache
+./package.sh --restart-zen    # y reinicia Zen con el entorno correcto
+```
+
+Zen no tiene `about:debugging`, así que recargar una extensión es empaquetar,
+instalar y reiniciar el navegador entero. El proceso se llama `zen-bin`, no
+`zen`: un `pkill -x zen` no hace nada. Y hace falta exportar `WAYLAND_DISPLAY`
+del proceso vivo, porque un shell de agente puede no tenerla y entonces Zen
+no relanza.
 
 ## Licencia
 MIT
